@@ -6,8 +6,8 @@ type Locale = 'zh' | 'en';
 
 export const translations = {
   zh: {
-    title: '多模态文件处理',
-    description: 'AI 驱动的文件分析与专业子代理',
+    title: '智能文档处理',
+    description: 'AI Agent 驱动的文档处理：PDF 合并、Word 转 PDF、Excel 转表格、图片分析、视频解析',
     dropFiles: '拖放文件或点击上传',
     process: '处理',
     clear: '清除',
@@ -30,10 +30,15 @@ export const translations = {
     queued: '排队中',
     done: '完成',
     error: '错误',
+    toolCalled: '工具调用',
+    supportedTypes: '支持 PDF、Word、Excel、图片、视频、CSV、文本',
+    video: '视频',
+    word: 'Word',
+    excel: 'Excel',
   },
   en: {
-    title: 'Multimodal File Processor',
-    description: 'AI-powered file analysis with specialized SubAgents',
+    title: 'Smart Document Processor',
+    description: 'AI Agent-powered: PDF merge, Word→PDF, Excel→Markdown, image analysis, video parsing',
     dropFiles: 'Drop files or click to upload',
     process: 'Process',
     clear: 'Clear',
@@ -56,6 +61,11 @@ export const translations = {
     queued: 'Queued',
     done: 'Done',
     error: 'Error',
+    toolCalled: 'Tool Called',
+    supportedTypes: 'Supports PDF, Word, Excel, Images, Video, CSV, Text',
+    video: 'Video',
+    word: 'Word',
+    excel: 'Excel',
   },
 };
 

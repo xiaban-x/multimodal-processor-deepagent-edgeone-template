@@ -1,9 +1,11 @@
-import { createModel, createLogger, getEnvVars } from './_shared';
+import Anthropic from '@anthropic-ai/sdk';
+import { resolveModelName, collectGatewayEnv } from './_model';
+import { createLogger } from './_shared';
 
 const logger = createLogger('test');
 
 export async function onRequest(context: any) {
-  const { request, env } = context;
+  const { request } = context;
   const { message } = request?.body ?? {};
   logger.log('test message:', message);
 
@@ -15,21 +17,35 @@ export async function onRequest(context: any) {
   }
 
   try {
-    getEnvVars(env);
-    const model = createModel({ timeout: 60_000 });
+    const env = collectGatewayEnv();
+    let baseURL = env.ANTHROPIC_BASE_URL || undefined;
 
-    logger.log('Calling model.invoke (simple, no agent overhead)...');
-    const response = await model.invoke([
-      { role: 'system', content: 'You are a test assistant. Reply with a short sentence to confirm you are working.' },
-      { role: 'user', content: message },
-    ]);
+    const client = new Anthropic({
+      apiKey: env.ANTHROPIC_API_KEY || process.env.AI_GATEWAY_API_KEY!,
+      baseURL,
+      timeout: 60_000,
+    });
 
-    const reply = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+    const model = resolveModelName();
+    logger.log(`Calling model: ${model}...`);
+
+    const response = await client.messages.create({
+      model,
+      max_tokens: 256,
+      messages: [{ role: 'user', content: message }],
+      system: 'You are a test assistant. Reply with a short sentence to confirm you are working.',
+    });
+
+    const reply = response.content
+      .filter((b) => b.type === 'text')
+      .map((b) => (b as any).text)
+      .join('');
+
     logger.log('Reply:', reply);
 
     return new Response(JSON.stringify({
       status: 'ok',
-      model: process.env.AI_MODEL || '@Pages/deepseek-v4-flash',
+      model,
       reply,
     }), {
       status: 200,
@@ -39,7 +55,7 @@ export async function onRequest(context: any) {
     logger.error('Error:', e.message);
     return new Response(JSON.stringify({
       status: 'error',
-      model: process.env.AI_MODEL || '@Pages/deepseek-v4-flash',
+      model: resolveModelName(),
       error: e.message,
     }), {
       status: 500,

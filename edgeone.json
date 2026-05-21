@@ -3,6 +3,6 @@
   "outputDirectory": ".next",
   "framework": "nextjs",
   "agents": {
-    "externalNodeModules": ["@langchain/openai", "@langchain/core"]
+    "externalNodeModules": ["@anthropic-ai/sdk", "@e2b/code-interpreter"]
   }
 }
