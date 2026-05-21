@@ -9,7 +9,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { resolveModelName, collectGatewayEnv } from '../_model';
+import { resolveModelName } from '../_model';
 import { createLogger, sseEvent, createSSEResponse } from '../_shared';
 
 const logger = createLogger('chat');
@@ -291,17 +291,21 @@ export async function onRequest(context: any) {
   if (uploadedFiles.length > 0) {
     const sandbox = context.sandbox;
     if (sandbox) {
-      // Ensure /tmp directory exists
-      try { await sandbox.files.makeDir('/tmp'); } catch { /* may already exist */ }
-
       for (const file of uploadedFiles) {
         try {
-          // Write file content (base64 decoded) to sandbox
           const content = Buffer.from(file.base64, 'base64');
           await sandbox.files.write(`/tmp/${file.name}`, content);
           logger.log(`[upload] wrote file to sandbox: /tmp/${file.name} (${content.length} bytes)`);
         } catch (e) {
-          logger.error(`[upload] failed to write /tmp/${file.name}:`, (e as Error).message);
+          // Retry once after short delay (handles ClientToken conflicts)
+          try {
+            await new Promise((r) => setTimeout(r, 500));
+            const content = Buffer.from(file.base64, 'base64');
+            await sandbox.files.write(`/tmp/${file.name}`, content);
+            logger.log(`[upload] wrote file to sandbox (retry): /tmp/${file.name}`);
+          } catch (e2) {
+            logger.error(`[upload] failed to write /tmp/${file.name}:`, (e2 as Error).message);
+          }
         }
       }
 
@@ -318,11 +322,13 @@ export async function onRequest(context: any) {
   }
 
   // Build Anthropic client
-  const env = collectGatewayEnv();
+  // Strip trailing /v1 — SDK appends it automatically
+  let baseURL = process.env.AI_GATEWAY_BASE_URL || '';
+  baseURL = baseURL.replace(/\/v1\/?$/, '');
 
   const client = new Anthropic({
-    apiKey: env.ANTHROPIC_API_KEY || process.env.AI_GATEWAY_API_KEY!,
-    baseURL: env.ANTHROPIC_BASE_URL,
+    apiKey: process.env.AI_GATEWAY_API_KEY!,
+    baseURL,
     timeout: 300_000,
   });
 
@@ -345,14 +351,20 @@ export async function onRequest(context: any) {
       turnCount++;
       if (sig?.aborted) break;
 
-      // Decide whether to stream (final text) or not (tool use expected)
-      const response = await client.messages.create({
-        model,
-        max_tokens: 8192,
-        system: SYSTEM_PROMPT,
-        tools: TOOLS,
-        messages,
-      });
+      let response: Anthropic.Message;
+      try {
+        response = await client.messages.create({
+          model,
+          max_tokens: 8192,
+          system: SYSTEM_PROMPT,
+          tools: TOOLS,
+          messages,
+        });
+      } catch (apiError: any) {
+        logger.error('[api] messages.create failed:', apiError.message, apiError.status, apiError.error);
+        yield sseEvent({ type: 'text_delta', delta: `\n\n❌ API 调用失败: ${apiError.message}` });
+        break;
+      }
 
       totalInput += response.usage?.input_tokens || 0;
       totalOutput += response.usage?.output_tokens || 0;

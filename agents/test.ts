@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { resolveModelName, collectGatewayEnv } from './_model';
+import { resolveModelName } from './_model';
 import { createLogger } from './_shared';
 
 const logger = createLogger('test');
@@ -17,11 +17,12 @@ export async function onRequest(context: any) {
   }
 
   try {
-    const env = collectGatewayEnv();
+    let baseURL = process.env.AI_GATEWAY_BASE_URL || '';
+    baseURL = baseURL.replace(/\/v1\/?$/, '');
 
     const client = new Anthropic({
-      apiKey: env.ANTHROPIC_API_KEY || process.env.AI_GATEWAY_API_KEY!,
-      baseURL: env.ANTHROPIC_BASE_URL,
+      apiKey: process.env.AI_GATEWAY_API_KEY!,
+      baseURL,
       timeout: 60_000,
     });
 
