@@ -319,11 +319,10 @@ export async function onRequest(context: any) {
 
   // Build Anthropic client
   const env = collectGatewayEnv();
-  const baseURL = env.ANTHROPIC_BASE_URL || undefined;
 
   const client = new Anthropic({
     apiKey: env.ANTHROPIC_API_KEY || process.env.AI_GATEWAY_API_KEY!,
-    baseURL,
+    baseURL: env.ANTHROPIC_BASE_URL,
     timeout: 300_000,
   });
 
