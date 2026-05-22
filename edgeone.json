@@ -3,6 +3,6 @@
   "outputDirectory": ".next",
   "framework": "nextjs",
   "agents": {
-    "externalNodeModules": ["@anthropic-ai/sdk", "@e2b/code-interpreter"]
+    "externalNodeModules": ["@anthropic-ai/sdk"]
   }
 }
