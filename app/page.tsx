@@ -257,9 +257,15 @@ export default function Home() {
               currentText += event.delta;
               if (!currentTextId) {
                 currentTextId = `text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                setActivities((prev) => [...prev, { id: currentTextId, timestamp: Date.now(), type: 'text', content: currentText }]);
+                const newId = currentTextId;
+                setActivities((prev) => {
+                  // Guard: don't append if already exists (React StrictMode / batching)
+                  if (prev.some((a) => a.id === newId)) return prev.map((a) => a.id === newId ? { ...a, content: currentText } : a);
+                  return [...prev, { id: newId, timestamp: Date.now(), type: 'text' as const, content: currentText }];
+                });
               } else {
-                setActivities((prev) => prev.map((a) => a.id === currentTextId ? { ...a, content: currentText } : a));
+                const updateId = currentTextId;
+                setActivities((prev) => prev.map((a) => a.id === updateId ? { ...a, content: currentText } : a));
               }
             } else if (event.type === 'tool_called' && event.tool) {
               // Reset text for next text block
