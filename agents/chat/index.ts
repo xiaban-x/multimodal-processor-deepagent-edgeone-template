@@ -277,6 +277,41 @@ function buildToolExecutors(context: any): { execute: (name: string, args: Recor
   return { execute: async () => { throw new Error('No tools available'); }, ready: false };
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+const TEXT_FALLBACK_EXTENSIONS = new Set([
+  '.txt',
+  '.md',
+  '.csv',
+  '.json',
+  '.xml',
+  '.html',
+  '.css',
+  '.js',
+  '.ts',
+  '.tsx',
+  '.py',
+  '.log',
+  '.yml',
+  '.yaml',
+  '.sql',
+]);
+
+function canInlineFallbackFile(fileName: string, content: Buffer): boolean {
+  const lowerName = fileName.toLowerCase();
+  const extension = lowerName.includes('.')
+    ? lowerName.slice(lowerName.lastIndexOf('.'))
+    : '';
+  if (!TEXT_FALLBACK_EXTENSIONS.has(extension)) return false;
+  if (content.includes(0)) return false;
+
+  const decoded = content.toString('utf8');
+  const replacementCount = decoded.match(/\uFFFD/g)?.length ?? 0;
+  return replacementCount / Math.max(decoded.length, 1) < 0.01;
+}
+
 export async function onRequest(context: any) {
   const body = context.request.body ?? {};
   let message = typeof body.message === "string" ? body.message.trim() : "";
@@ -350,22 +385,18 @@ export async function onRequest(context: any) {
   if (uploadedFiles.length > 0 && toolBundle.ready) {
     // Test sandbox readiness
     try {
-      const testResult = await toolBundle.execute('files', { op: 'list', path: '/tmp' });
-      if (testResult && testResult.length > 10) {
-        sandboxWorking = true;
-        logger.log('[sandbox] ready');
-      }
+      await toolBundle.execute('files', { op: 'list', path: '/tmp' });
+      sandboxWorking = true;
+      logger.log('[sandbox] ready');
     } catch (e) {
       // Retry with delay
       for (let attempt = 0; attempt < 3; attempt++) {
         await new Promise((r) => setTimeout(r, 3000));
         try {
-          const retryResult = await toolBundle.execute('files', { op: 'list', path: '/tmp' });
-          if (retryResult && retryResult.length > 10) {
-            sandboxWorking = true;
-            logger.log(`[sandbox] ready (after ${attempt + 1} retries)`);
-            break;
-          }
+          await toolBundle.execute('files', { op: 'list', path: '/tmp' });
+          sandboxWorking = true;
+          logger.log(`[sandbox] ready (after ${attempt + 1} retries)`);
+          break;
         } catch {
           logger.log(`[sandbox] not ready, retrying... (attempt ${attempt + 1})`);
         }
@@ -375,9 +406,11 @@ export async function onRequest(context: any) {
     if (sandboxWorking) {
       for (const file of uploadedFiles) {
         try {
-          const decoded = Buffer.from(file.base64, 'base64').toString('utf-8');
-          await toolBundle.execute('files', { op: 'write', path: `/tmp/${file.name}`, content: decoded });
-          logger.log(`[upload] wrote file to sandbox: /tmp/${file.name}`);
+          const sandboxPath = `/tmp/${file.name}`;
+          await toolBundle.execute('commands', {
+            cmd: `printf %s ${shellQuote(file.base64)} | base64 -d > ${shellQuote(sandboxPath)}`,
+          });
+          logger.log(`[upload] wrote file to sandbox: ${sandboxPath}`);
         } catch (e) {
           logger.error(`[upload] failed to write /tmp/${file.name}:`, (e as Error).message);
           sandboxWorking = false;
@@ -397,16 +430,31 @@ export async function onRequest(context: any) {
     }
   }
 
-  // Fallback: if sandbox not working, inline file content into message
+  // Fallback: if sandbox not working, inline text file content into message
   if (!sandboxWorking && uploadedFiles.length > 0) {
-    logger.log('[fallback] sandbox unavailable, inlining file content into message');
-    let inlineContent = '\n\n--- FILE CONTENTS (sandbox unavailable, analyze from text below) ---\n';
+    logger.log('[fallback] sandbox unavailable, inlining text file content into message');
+    let inlineContent = '\n\n--- FILE CONTENTS (sandbox unavailable, analyze text files below) ---\n';
+    const skippedFiles: string[] = [];
+
     for (const file of uploadedFiles) {
       try {
-        const decoded = Buffer.from(file.base64, 'base64').toString('utf-8');
+        const content = Buffer.from(file.base64, 'base64');
+        if (!canInlineFallbackFile(file.name, content)) {
+          skippedFiles.push(file.name);
+          continue;
+        }
+
+        const decoded = content.toString('utf8');
         inlineContent += `\n### File: ${file.name}\n\`\`\`\n${decoded}\n\`\`\`\n`;
-      } catch { /* skip binary files */ }
+      } catch {
+        skippedFiles.push(file.name);
+      }
     }
+
+    if (skippedFiles.length > 0) {
+      inlineContent += `\nSkipped binary or non-text files because sandbox is unavailable: ${skippedFiles.join(', ')}\n`;
+    }
+
     message = message + inlineContent;
   }
 

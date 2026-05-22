@@ -28,10 +28,10 @@ export async function onRequest(context: any) {
     const commandsTool = context.tools.get('commands');
     if (commandsTool) {
       const writeResult = await commandsTool.execute({
-        command: `echo '${testContent}' > ${testPath}`
+        cmd: `echo '${testContent}' > ${testPath}`
       });
       const readResult = await commandsTool.execute({
-        command: `cat ${testPath}`
+        cmd: `cat ${testPath}`
       });
       results['method2_tools_get_commands'] = {
         status: 'success',
@@ -51,12 +51,12 @@ export async function onRequest(context: any) {
     const filesTool = context.tools.get('files');
     if (filesTool) {
       const writeResult = await filesTool.execute({
-        action: 'write',
+        op: 'write',
         path: '/tmp/sandbox-test-files-api.txt',
         content: testContent
       });
       const readResult = await filesTool.execute({
-        action: 'read',
+        op: 'read',
         path: '/tmp/sandbox-test-files-api.txt'
       });
       results['method2_tools_get_files'] = {
@@ -77,6 +77,7 @@ export async function onRequest(context: any) {
     const codeTool = context.tools.get('code_interpreter');
     if (codeTool) {
       const codeResult = await codeTool.execute({
+        language: 'python',
         code: `
 with open('${testPath}', 'w') as f:
     f.write('${testContent}')
@@ -209,20 +210,21 @@ with open('${testPath}', 'r') as f:
       for (const block of assistantContent) {
         if (block.type === 'tool_use') {
           let result = '';
+          const input = block.input as { path?: string; content?: string };
           try {
             if (block.name === 'write_file') {
               const commandsTool = context.tools.get('commands');
               if (commandsTool) {
-                const b64 = Buffer.from(block.input.content).toString('base64');
-                await commandsTool.execute({ command: `echo '${b64}' | base64 -d > ${block.input.path}` });
-                result = `File written to ${block.input.path}`;
+                const b64 = Buffer.from(input.content ?? '').toString('base64');
+                await commandsTool.execute({ cmd: `echo '${b64}' | base64 -d > ${input.path}` });
+                result = `File written to ${input.path}`;
               } else {
                 result = 'commands tool not available';
               }
             } else if (block.name === 'read_file') {
               const commandsTool = context.tools.get('commands');
               if (commandsTool) {
-                const readRes = await commandsTool.execute({ command: `cat ${block.input.path}` });
+                const readRes = await commandsTool.execute({ cmd: `cat ${input.path}` });
                 result = typeof readRes === 'string' ? readRes : JSON.stringify(readRes);
               } else {
                 result = 'commands tool not available';
