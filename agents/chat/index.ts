@@ -590,12 +590,14 @@ export async function onRequest(context: any) {
               }
             }
 
-            // For code_interpreter, emit stdout as a code result for the user to see
+            // For code_interpreter, emit only clean stdout for the user to see
+            // Errors and raw JSON are kept internal (model sees them in tool_result)
             if (toolName === "code_interpreter") {
               try {
                 const parsed = typeof resultText === 'string' ? JSON.parse(resultText) : resultText;
-                const stdout = parsed.stdout || (parsed.logs?.stdout || []).join('') || '';
-                const stderr = parsed.stderr || (parsed.logs?.stderr || []).join('') || parsed.error || '';
+                const stdoutArr = parsed.logs?.stdout || [];
+                const stdout = Array.isArray(stdoutArr) ? stdoutArr.join('') : (parsed.stdout || '');
+                // Only emit stdout (user-visible output), skip stderr/errors/raw JSON
                 if (stdout.trim()) {
                   yield sseEvent({
                     type: "code_output",
@@ -603,16 +605,11 @@ export async function onRequest(context: any) {
                     stdout: stdout,
                   });
                 }
-                if (stderr.trim()) {
-                  yield sseEvent({
-                    type: "code_output",
-                    tool: toolName,
-                    stderr: stderr,
-                  });
-                }
+                // Do NOT emit stderr or error tracebacks to the user
               } catch {
                 // If resultText is plain text (not JSON), show it directly
-                if (resultText.trim()) {
+                // but filter out anything that looks like a raw JSON blob
+                if (resultText.trim() && !resultText.trim().startsWith('{')) {
                   yield sseEvent({ type: "code_output", tool: toolName, stdout: resultText });
                 }
               }
@@ -632,10 +629,12 @@ export async function onRequest(context: any) {
         }
       }
 
-      // If no tool use, we're done
-      if (!hasToolUse || response.stop_reason === "end_turn") {
+      // If no tool use, we're done. Only break when there is genuinely no tool_use block.
+      // When hasToolUse is true we MUST continue the loop regardless of stop_reason,
+      // because the model may emit text + tool_use in one response with stop_reason=end_turn.
+      if (!hasToolUse) {
         logger.log(
-          `[loop] ending: hasToolUse=${hasToolUse}, stop_reason=${response.stop_reason}, turn=${turnCount}`
+          `[loop] ending: no tool_use, stop_reason=${response.stop_reason}, turn=${turnCount}`
         );
         break;
       }
