@@ -21,7 +21,7 @@ export interface FileItem {
 interface ActivityEntry {
   id: string;
   timestamp: number;
-  type: 'user' | 'text' | 'tool_call' | 'tool_output' | 'file_download' | 'error' | 'system';
+  type: 'user' | 'text' | 'tool_call' | 'tool_output' | 'file_download' | 'error' | 'system' | 'suggestions';
   content: string;
   meta?: Record<string, any>;
 }
@@ -88,11 +88,16 @@ function toolToAgentAction(tool: string, input: any, locale: string): string {
       return isZh ? `📄 文件操作: ${op}` : `📄 File op: ${op}`;
     }
     case 'commands': {
-      const cmd = (input?.cmd || '').slice(0, 60);
-      if (cmd.includes('pip install')) return isZh ? `📦 安装依赖包...` : `📦 Installing packages...`;
-      if (cmd.includes('ffprobe') || cmd.includes('ffmpeg')) return isZh ? `🎬 分析视频元数据` : `🎬 Analyzing video metadata`;
-      if (cmd.includes('base64')) return isZh ? `📤 准备文件下载` : `📤 Preparing file download`;
-      return isZh ? `⚡ 执行命令: ${cmd}` : `⚡ Running: ${cmd}`;
+      const cmd = (input?.cmd || '').slice(0, 120);
+      if (cmd.includes('pip install')) return isZh ? `📦 准备处理环境...` : `📦 Preparing environment...`;
+      if (cmd.includes('ffprobe') || cmd.includes('ffmpeg')) {
+        // Check if it's actually image-related
+        if (cmd.match(/\.(png|jpg|jpeg|gif|webp|bmp|svg)/i)) return isZh ? `🖼️ 分析图片信息` : `🖼️ Analyzing image`;
+        return isZh ? `🎬 分析媒体信息` : `🎬 Analyzing media`;
+      }
+      if (cmd.includes('base64')) return isZh ? `📤 准备文件下载` : `📤 Preparing download`;
+      if (cmd.includes('file ') || cmd.includes('identify')) return isZh ? `🔍 检查文件信息` : `🔍 Checking file info`;
+      return isZh ? `⚡ 正在处理...` : `⚡ Processing...`;
     }
     case 'code_interpreter': {
       const lang = input?.language || 'python';
@@ -153,6 +158,7 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   // IME composition tracking
   const isComposingRef = useRef(false);
+  const pendingAutoAnalyze = useRef(false);
 
   useEffect(() => {
     activityEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -183,6 +189,7 @@ export default function Home() {
     );
     setFiles((prev) => [...prev, ...items]);
     if (fileInputRef.current) fileInputRef.current.value = '';
+    pendingAutoAnalyze.current = true;
   }, []);
 
   const loadSamples = useCallback(() => {
@@ -190,11 +197,11 @@ export default function Home() {
       ...f, id: crypto.randomUUID(), base64: generateSampleContent(f.name),
     }));
     setFiles(items);
-    addActivity('system', locale === 'zh' ? '已加载 4 个示例文件' : 'Loaded 4 sample files');
-  }, [addActivity, locale]);
+    pendingAutoAnalyze.current = true;
+  }, []);
 
   // Send message
-  const sendMessage = useCallback(async (customMsg?: string) => {
+  const sendMessage = useCallback(async (customMsg?: string, silent?: boolean) => {
     const text = customMsg || userInput.trim();
     if (!text || isProcessing) return;
     setIsProcessing(true);
@@ -206,7 +213,7 @@ export default function Home() {
 
     if (queuedFiles.length > 0) {
       const desc = queuedFiles.map((f) => `- ${f.name} (${f.type}, ${f.size})`).join('\n');
-      fullMessage = `${text}\n\n当前上传的文件（已写入沙箱 /tmp/ 目录）：\n${desc}`;
+      fullMessage = `${text}\n\n上传的文件：\n${desc}`;
       for (const f of queuedFiles) {
         if (f.base64) filesToUpload.push({ name: f.name, base64: f.base64 });
       }
@@ -218,10 +225,15 @@ export default function Home() {
       : '\n\n[Language: All output (including generated files, report titles, headers) must be in English]';
     fullMessage += langHint;
 
-    addActivity('user', text);
-    addActivity('system', locale === 'zh'
-      ? `🚀 Agent 启动 · 沙箱初始化中... (${filesToUpload.length} 个文件待上传)`
-      : `🚀 Agent started · Sandbox initializing... (${filesToUpload.length} files to upload)`);
+    if (silent) {
+      // Auto-triggered: show friendly system message instead of raw prompt
+      const fileCount = queuedFiles.length || files.length;
+      const msg = locale === 'zh' ? `📎 已接收 ${fileCount} 份文件，正在分析...` : `📎 Received ${fileCount} file(s), analyzing...`;
+      addActivity('system', msg);
+    } else {
+      addActivity('user', text);
+    }
+    addActivity('system', t.startProcessing);
 
     try {
       const resp = await fetch('/chat', {
@@ -230,7 +242,18 @@ export default function Home() {
         body: JSON.stringify({ message: fullMessage, conversationId, files: filesToUpload.length > 0 ? filesToUpload : undefined }),
       });
 
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok) {
+        let errMsg = `HTTP ${resp.status}`;
+        try {
+          const errBody = await resp.text();
+          if (resp.status === 429 || errBody.includes("quota")) {
+            errMsg = t.quotaExhausted;
+          } else if (errBody) {
+            errMsg = errBody.slice(0, 200);
+          }
+        } catch {}
+        throw new Error(errMsg);
+      }
       const reader = resp.body?.getReader();
       if (!reader) throw new Error('No stream');
 
@@ -238,6 +261,8 @@ export default function Home() {
       let buffer = '';
       let currentText = '';
       let currentTextId = '';
+      // Defer suggest_actions to display at the very end
+      let pendingSuggestions: Array<{ id: string; emoji: string; title: string; description: string }> | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -255,26 +280,42 @@ export default function Home() {
 
             if (event.type === 'text_delta' && event.delta) {
               currentText += event.delta;
+              // Capture snapshot to avoid stale closure (React batches state updates)
+              const snapshot = currentText;
               if (!currentTextId) {
                 currentTextId = `text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                 const newId = currentTextId;
                 setActivities((prev) => {
                   // Guard: don't append if already exists (React StrictMode / batching)
-                  if (prev.some((a) => a.id === newId)) return prev.map((a) => a.id === newId ? { ...a, content: currentText } : a);
-                  return [...prev, { id: newId, timestamp: Date.now(), type: 'text' as const, content: currentText }];
+                  if (prev.some((a) => a.id === newId)) return prev.map((a) => a.id === newId ? { ...a, content: snapshot } : a);
+                  return [...prev, { id: newId, timestamp: Date.now(), type: 'text' as const, content: snapshot }];
                 });
               } else {
                 const updateId = currentTextId;
-                setActivities((prev) => prev.map((a) => a.id === updateId ? { ...a, content: currentText } : a));
+                setActivities((prev) => prev.map((a) => a.id === updateId ? { ...a, content: snapshot } : a));
               }
             } else if (event.type === 'tool_called' && event.tool) {
               // Reset text for next text block
               currentText = '';
               currentTextId = '';
-              const agentAction = toolToAgentAction(event.tool, event.input, locale);
-              addActivity('tool_call', agentAction, { tool: event.tool, input: JSON.stringify(event.input, null, 2) });
+              // Don't show suggest_actions as a tool call — it's handled via its own event
+              if (event.tool !== 'suggest_actions') {
+                const agentAction = toolToAgentAction(event.tool, event.input, locale);
+                // Collapse repeated tool_call entries with same label — update last one instead of creating new
+                setActivities((prev) => {
+                  const lastIdx = prev.length - 1;
+                  if (lastIdx >= 0 && prev[lastIdx].type === 'tool_call' && prev[lastIdx].content === agentAction) {
+                    // Same action repeated — just keep the existing one (don't spam)
+                    return prev;
+                  }
+                  return [...prev, { id: `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, timestamp: Date.now(), type: 'tool_call' as const, content: agentAction, meta: { tool: event.tool } }];
+                });
+              }
+            } else if (event.type === 'suggest_actions' && event.actions) {
+              // Defer suggestions — render at the very end of the response
+              pendingSuggestions = event.actions;
             } else if (event.type === 'code_output') {
-              if (event.stdout?.trim()) addActivity('tool_output', event.stdout);
+              // Only show errors, hide normal stdout (technical logs)
               if (event.stderr?.trim()) addActivity('error', event.stderr);
             } else if (event.type === 'file_output' && event.filename) {
               addActivity('file_download', event.filename, { base64: event.base64, description: event.description });
@@ -285,13 +326,27 @@ export default function Home() {
         }
       }
 
-      addActivity('system', locale === 'zh' ? '✅ 任务完成' : '✅ Task completed');
+      // Render deferred suggestions at the very end (after all text/tool outputs)
+      if (pendingSuggestions) {
+        addActivity('suggestions', '', { actions: pendingSuggestions });
+      } else {
+        addActivity('system', t.taskComplete);
+      }
     } catch (err) {
       addActivity('error', `${(err as Error).message}`);
     } finally {
       setIsProcessing(false);
     }
   }, [userInput, files, isProcessing, conversationId, addActivity, locale]);
+
+  // Auto-trigger analysis when files are added
+  useEffect(() => {
+    if (pendingAutoAnalyze.current && files.length > 0 && !isProcessing) {
+      pendingAutoAnalyze.current = false;
+      // Pass special flag to avoid showing raw prompt as user message
+      sendMessage(t.suggestPrompt, true);
+    }
+  }, [files, isProcessing, sendMessage, t.suggestPrompt]);
 
   const isDark = theme === 'dark';
 
@@ -331,10 +386,6 @@ export default function Home() {
                 className={`flex-1 px-2 py-1.5 text-xs font-mono rounded border transition-colors disabled:opacity-50 ${isDark ? 'bg-gray-800 hover:bg-gray-700 border-gray-700' : 'bg-gray-50 hover:bg-gray-100 border-gray-200'}`}>
                 + {locale === 'zh' ? '上传' : 'Upload'}
               </button>
-              <button onClick={loadSamples} disabled={isProcessing}
-                className={`flex-1 px-2 py-1.5 text-xs font-mono rounded border transition-colors disabled:opacity-50 ${isDark ? 'bg-gray-800 hover:bg-gray-700 border-gray-700' : 'bg-gray-50 hover:bg-gray-100 border-gray-200'}`}>
-                Demo
-              </button>
               {files.length > 0 && (
                 <button onClick={() => setFiles([])} disabled={isProcessing}
                   className={`px-2 py-1.5 text-xs font-mono rounded border transition-colors disabled:opacity-50 ${isDark ? 'bg-gray-800 hover:bg-gray-700 border-gray-700 text-red-400' : 'bg-gray-50 hover:bg-gray-100 border-gray-200 text-red-500'}`}>
@@ -348,9 +399,13 @@ export default function Home() {
 
           <div className="flex-1 overflow-y-auto p-2 space-y-1">
             {files.map((f) => (
-              <div key={f.id} className={`px-2 py-1.5 rounded flex items-center gap-2 ${isDark ? 'bg-gray-900 border border-gray-800' : 'bg-gray-50 border border-gray-100'}`}>
+              <div key={f.id} className={`px-2 py-1.5 rounded flex items-center gap-2 group ${isDark ? 'bg-gray-900 border border-gray-800' : 'bg-gray-50 border border-gray-100'}`}>
                 <span className={`text-[10px] font-mono px-1 py-0.5 rounded uppercase ${isDark ? 'bg-gray-800 text-gray-400' : 'bg-gray-200 text-gray-500'}`}>{f.type.slice(0, 3)}</span>
                 <span className={`text-xs font-mono truncate flex-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{f.name}</span>
+                <button
+                  onClick={() => setFiles((prev) => prev.filter((x) => x.id !== f.id))}
+                  className={`opacity-0 group-hover:opacity-100 transition-opacity text-xs px-1 rounded ${isDark ? 'text-gray-500 hover:text-red-400 hover:bg-gray-800' : 'text-gray-400 hover:text-red-500 hover:bg-gray-100'}`}
+                >×</button>
               </div>
             ))}
             {files.length === 0 && (
@@ -405,13 +460,19 @@ export default function Home() {
           <div className="flex-1 overflow-y-auto px-5 py-4 space-y-2">
             {activities.length === 0 && (
               <div className="flex items-center justify-center h-full">
-                <div className="text-center">
-                  <p className={`font-mono text-sm mb-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                    {locale === 'zh' ? 'Agent 就绪' : 'Agent Ready'}
+                <div className="text-center max-w-xs">
+                  <p className={`text-sm mb-3 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                    {t.emptyHint}
                   </p>
-                  <p className={`font-mono text-xs ${isDark ? 'text-gray-700' : 'text-gray-300'}`}>
-                    {locale === 'zh' ? '上传文件后发送指令开始处理' : 'Upload files and send a command to start'}
+                  <p className={`text-xs font-medium mb-4 px-3 py-1.5 rounded-full inline-block ${isDark ? 'bg-blue-900/30 text-blue-300 border border-blue-800/50' : 'bg-blue-50 text-blue-600 border border-blue-200'}`}>
+                    {t.supportedTypes}
                   </p>
+                  <div>
+                    <button onClick={loadSamples} disabled={isProcessing}
+                      className={`px-4 py-2 text-xs rounded-lg border transition-colors disabled:opacity-50 ${isDark ? 'bg-gray-800 hover:bg-gray-700 border-gray-700 text-gray-300' : 'bg-gray-50 hover:bg-gray-100 border-gray-200 text-gray-600'}`}>
+                      {t.importSample}
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
@@ -434,7 +495,7 @@ export default function Home() {
                 {entry.type === 'tool_call' && (
                   <>
                     <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-yellow-900/30 text-yellow-300' : 'bg-yellow-100 text-yellow-700'}`}>
-                      {entry.meta?.tool === 'code_interpreter' ? 'RUN' : 'CALL'}
+                      {locale === 'zh' ? '操作' : 'ACT'}
                     </span>
                     <div className="flex-1 min-w-0">
                       <span className={`text-xs font-mono ${isDark ? 'text-yellow-200' : 'text-yellow-700'}`}>{entry.content}</span>
@@ -442,13 +503,32 @@ export default function Home() {
                   </>
                 )}
 
-                {entry.type === 'tool_output' && (
-                  <>
-                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-green-900/30 text-green-300' : 'bg-green-100 text-green-700'}`}>OUT</span>
-                    <div className="flex-1 min-w-0 overflow-x-auto">
-                      <MarkdownBlock content={entry.content} />
+                {/* tool_output hidden — only errors are shown */}
+
+                {entry.type === 'suggestions' && entry.meta?.actions && (
+                  <div className="flex-1 min-w-0">
+                    <div className="grid grid-cols-1 gap-2 mt-1">
+                      {(entry.meta.actions as Array<{ id: string; emoji: string; title: string; description: string }>).map((action) => (
+                        <button
+                          key={action.id}
+                          onClick={() => sendMessage(action.title)}
+                          disabled={isProcessing}
+                          className={`text-left px-3 py-2.5 rounded-lg border transition-all disabled:opacity-50 ${isDark
+                            ? 'bg-gray-800/50 hover:bg-gray-700/80 border-gray-700 hover:border-blue-600'
+                            : 'bg-white hover:bg-blue-50 border-gray-200 hover:border-blue-300'
+                          }`}
+                        >
+                          <div className="flex items-start gap-2.5">
+                            <span className="text-lg flex-shrink-0">{action.emoji}</span>
+                            <div className="min-w-0">
+                              <p className={`text-xs font-medium ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{action.title}</p>
+                              <p className={`text-[11px] mt-0.5 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{action.description}</p>
+                            </div>
+                          </div>
+                        </button>
+                      ))}
                     </div>
-                  </>
+                  </div>
                 )}
 
                 {entry.type === 'text' && (
