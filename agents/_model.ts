@@ -3,5 +3,5 @@
  */
 
 export function resolveModelName(): string {
-  return '@makes/deepseek-v4-flash';
+  return '@makers/deepseek-v4-flash';
 }

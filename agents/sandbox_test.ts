@@ -191,7 +191,7 @@ with open('${testPath}', 'r') as f:
     while (rounds < maxRounds) {
       rounds++;
       const response = await client.messages.create({
-        model: '@makes/deepseek-v4-flash',
+        model: '@makers/deepseek-v4-flash',
         max_tokens: 1024,
         tools,
         messages,
