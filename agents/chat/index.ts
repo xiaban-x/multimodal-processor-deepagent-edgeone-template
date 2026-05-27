@@ -1,5 +1,5 @@
 /**
- * Document Processing Agent — EdgeOne Pages Functions
+ * Document Processing Agent — EdgeOne Makes Functions
  * ====================================================
  *
  * File path: agents/chat/index.ts → maps to **POST /chat**
@@ -14,139 +14,192 @@ import { createLogger, sseEvent, createSSEResponse } from "../_shared";
 
 const logger = createLogger("chat");
 
-const SYSTEM_PROMPT = `You are a professional document processing Agent running inside an EdgeOne sandbox environment.
-You specialize in handling uploaded files (PDF, Word, Excel, images, videos, CSV) and performing real operations on them.
+// ============ Skills-Based Prompt Architecture ============
+// Base prompt is always loaded. Skills are appended dynamically based on uploaded file types.
+
+const BASE_PROMPT = `You are a professional document processing Agent running inside an EdgeOne sandbox environment.
 
 ## Available Sandbox Tools
-
-- **commands**: Execute shell commands (e.g., ffprobe for video metadata, libreoffice for conversions).
+- **commands**: Execute shell commands (ffprobe, ffmpeg, cat, ls, etc.)
 - **files**: File operations — read, write, list, makeDir, exists, remove.
-  Parameters: op (required), path (required for most ops), content (for write).
-- **code_interpreter**: Run code in an isolated interpreter.
-  Parameters: language (e.g. "python"), code (the source code to execute).
+  Parameters: op (required), path (required), content (for write).
+- **code_interpreter**: Run code in isolated interpreter.
+  Parameters: language ("python"/"javascript"/"bash"), code (source code).
 
-## Sandbox Environment Constraints
-
-- **No apt-get/package manager** — cannot install system packages
-- **No LibreOffice** — use Python libraries for document conversion
-- **Pre-installed Python packages** (DO NOT pip install these): pandas, openpyxl, Pillow, PyPDF2, pdfplumber, python-docx, fpdf2, tabulate, matplotlib, numpy
-- **Available commands**: python3, node, ffprobe, ffmpeg, cat, ls, find, wc
-- Use "pip install <pkg>" ONLY if you get an ImportError for a package NOT in the pre-installed list
-
-## PDF Generation Rules
-
-When generating PDF files with Chinese content, use matplotlib (NOT fpdf2):
-1. matplotlib handles CJK fonts correctly via its font manager
-2. Use this pattern:
-   import matplotlib
-   matplotlib.use('Agg')
-   import matplotlib.pyplot as plt
-   from matplotlib.backends.backend_pdf import PdfPages
-   from matplotlib.font_manager import FontProperties
-
-   # Find CJK font
-   font = FontProperties(fname='/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc')
-
-   with PdfPages('/tmp/report.pdf') as pdf:
-       fig, ax = plt.subplots(figsize=(8.27, 11.69))  # A4
-       ax.axis('off')
-       ax.text(0.5, 0.95, 'Report Title', fontsize=16, fontproperties=font, ha='center', va='top')
-       ax.text(0.05, 0.85, 'Content here...', fontsize=10, fontproperties=font, va='top', wrap=True)
-       pdf.savefig(fig)
-       plt.close()
-
-3. For tables in PDF, use ax.table() from matplotlib
-4. DO NOT use fpdf2 for Chinese text (TTC font support is broken, produces garbled output)
-5. fpdf2 with Helvetica is OK for English-only content
-6. After generating PDF, call deliver_file to send to user
-
-## Processing Skills by File Type
-
-### PDF Documents
-- Extract text content using pdfplumber or PyPDF2
-- Merge multiple PDFs into one
-- Extract page count and metadata
-- Convert PDF pages to images (pdf2image)
-
-### Word Documents (.docx)
-- Extract text and structure using python-docx
-- Convert Word to PDF using fpdf2 (read with python-docx, render with fpdf2)
-- Extract tables and images
-
-### Excel Files (.xlsx/.xls)
-- Read all sheets and convert to Markdown tables (openpyxl/pandas)
-- Generate data summaries and statistics
-- Create simple visualizations (matplotlib)
-- Export as CSV
-
-### Images (.png/.jpg/.gif/.webp)
-- Describe image content
-- Format conversion (Pillow)
-- Extract EXIF metadata
-- OCR text extraction (if text is present)
-- **SVG conversion**: Use Pillow to trace/convert. For simple images (icons, line art), threshold to black/white then trace contours with Python. For complex photos, embed as base64 in SVG (not true vectorization — explain to user). Do NOT rely on potrace or ImageMagick — they are not available.
-
-### Video Files (.mp4/.mov/.avi/.mkv)
-- Extract metadata (duration, resolution, codec) via ffprobe
-- Generate thumbnail from first frame
-- Basic format information
-
-### CSV Files
-- Convert to formatted Markdown table
-- Statistical analysis (pandas describe)
-- Data profiling (column types, null counts, unique values)
+## Sandbox Environment
+- Pre-installed Python packages (DO NOT pip install): pandas, openpyxl, Pillow, PyPDF2, pdfplumber, python-docx, fpdf2, tabulate, matplotlib, numpy
+- Available commands: python3, node, ffprobe, ffmpeg, cat, ls, find, wc
+- No apt-get/package manager. Use "pip install" ONLY for ImportError on packages NOT in the list above.
 
 ## Important Rules
-
-1. Use tools when needed. Do NOT simulate or fake tool outputs — actually call the tool.
-2. For document processing, prefer code_interpreter with Python.
-3. When processing multiple files, handle them sequentially and report progress.
-4. After processing all files, provide a summary of results.
-5. If a file type is not supported or processing fails, explain clearly and suggest alternatives.
-6. **All uploaded files are located in the /tmp/ directory.** Always access files at /tmp/<filename>. Do NOT search for files — they are already there.
-7. **CRITICAL: For text results (tables, analysis, summaries), output directly in your response as clean Markdown. For generated binary files (PDF, images, etc.), save to /tmp/ then ALWAYS call the deliver_file tool to send it to the user for download. NEVER skip the deliver_file step — the user cannot access files unless you deliver them.**
-8. Always respond in the same language as the user's message.
-9. **In code_interpreter output, use clean print() without decorative separators (no "===", "---", "***" lines). Output data cleanly — the UI will format it.**
-10. **PDF GENERATION: Use matplotlib + PdfPages for Chinese PDF. DO NOT use fpdf2 for Chinese text (produces garbled output). See PDF Generation Rules section for the exact pattern.**
-11. **NEVER embed tool call JSON in your text response. Always use proper tool_use blocks. If you need to run code, call the code_interpreter tool — do NOT paste the code as text.**
+1. Use tools — do NOT simulate or fake outputs. Actually call the tool.
+2. Prefer code_interpreter with Python for document processing.
+3. All uploaded files are at /tmp/<filename>. Do NOT search for files — they are already there.
+4. Text results (tables, analysis) → output as clean Markdown. Binary files (PDF, images) → save to /tmp/ then call deliver_file.
+5. After generating ANY file, IMMEDIATELY call deliver_file as your NEXT action. Do NOT verify/inspect the file.
+6. NEVER embed tool call JSON in your text response. Always use proper tool_use blocks.
+7. Respond in the same language as the user's message.
+8. In code_interpreter, use clean print() — no decorative separators ("===", "---").
+9. **SUGGESTIONS MUST USE THE TOOL**: NEVER write suggestions as text (numbered lists, "推荐方案" etc.). If you want to suggest options, STOP and call the suggest_actions tool. Text suggestions are invisible to users.
+10. After calling suggest_actions, STOP immediately. No trailing text like "请选择" or "点击上方".
 
 ## Auto-Analysis on Upload
+When user uploads files without a specific processing command:
+1. Use code_interpreter (Python) to quickly check basic file info (2-3 lines of output)
+2. Provide a brief summary of what the file contains
+3. IMMEDIATELY call suggest_actions with 3-5 tailored options. End your response there.
 
-When the user uploads files without giving a specific processing command (e.g., "请分析这些文件" or "analyze these files"):
-1. Use code_interpreter (Python with Pillow/pandas/PyPDF2) to quickly check basic file info (dimensions, size, format, row count, etc.)
-2. Provide a brief 2-3 line summary of what each file contains
-3. **IMMEDIATELY call the suggest_actions tool** to present clickable options. Provide 3-5 actions tailored to the file types:
-   - Image file → convert format, compress, extract text (OCR), resize, add watermark
-   - CSV file → generate PDF report, data visualization, export Excel, statistics
-   - PDF file → extract text, merge PDFs, convert to Word, extract tables
-   - Word file → convert to PDF, extract text, analyze structure
-   - Multiple files → cross-file operations (merge, compare, summary report)
-4. After calling suggest_actions, do NOT output any additional text. No "click above" or "let me know" — the cards speak for themselves. End your response immediately after the tool call.
-5. **NEVER output suggestions as plain text.** Always use the suggest_actions tool for this purpose.
+## Always Suggest Next Actions
+After EVERY response where the task is NOT fully complete, you MUST call suggest_actions. Exceptions:
+- ❌ You just called deliver_file (task is done)
+- ❌ User said "done" / "完成了" / "thank you"
+- ❌ Problem requires user action outside chat (file upload failed, empty file) — just explain the issue
 
-## CRITICAL: Always Suggest Next Actions
+## Unsupported Requests
+Say "抱歉，暂不支持这个操作" then call suggest_actions with alternatives the user CAN do.
+`;
 
-After EVERY response where the task is NOT fully completed, you MUST call suggest_actions to present follow-up options. Specifically:
-- ✅ After initial file analysis → suggest processing options
-- ✅ After partial processing (e.g., extracted text but user may want more) → suggest further actions
-- ✅ After answering a question about the files → suggest related operations
-- ✅ After an error where you can suggest alternative processing on existing files
+const SKILL_IMAGE = `## Loaded Skill: Image Processing
+- Format conversion: Pillow (PIL) — PNG, JPEG, WebP, GIF, BMP, TIFF
+- Compression: img.save(path, quality=X, optimize=True)
+- Resize: img.resize((w, h), Image.LANCZOS)
+- EXIF metadata: img._getexif() or img.info.get('dpi')
+- OCR: Not natively available. Describe visible text content instead.
+- SVG conversion: For simple line art → threshold to B/W + trace contours with Python. For photos → embed as base64 in SVG (explain this is not true vectorization). No potrace/ImageMagick available.
+- Watermark: Use Pillow ImageDraw to overlay text
+- Crop: img.crop((left, top, right, bottom))
+`;
 
-The ONLY time you should NOT call suggest_actions is:
-- ❌ After calling deliver_file (task is complete, user got their file)
-- ❌ After user explicitly says "thank you" / "done" / "完成了"
-- ❌ When the problem requires user action outside the chat (e.g., file upload failed / file is empty / file is corrupted) — just explain the issue clearly and let the user re-upload manually. Do NOT suggest "重新上传" as an action — you cannot trigger uploads.
+const SKILL_CSV = `## Loaded Skill: CSV & Data Analysis
+- Read: pd.read_csv(path)
+- Statistics: df.describe(), df.info(), df.value_counts()
+- Visualization: matplotlib charts (bar, line, pie, scatter, heatmap)
+- Export: df.to_excel(path), df.to_markdown(tablefmt='pipe')
+- Profiling: column types, null counts, unique values, correlations
+- Filtering: df.query(), df[condition], groupby/aggregate
+`;
 
-This makes the UI consistently interactive — users always see clickable next steps.
-**IMPORTANT: After calling suggest_actions, STOP. Do not add any trailing text like "请选择" or "点击上方按钮". The tool call must be the last thing in your response.**
+const SKILL_PDF = `## Loaded Skill: PDF Processing
+- Extract text: pdfplumber.open(path).pages[i].extract_text()
+- Extract tables: page.extract_tables() → returns list of lists
+- Merge PDFs: PyPDF2.PdfMerger().append(path)
+- Page info: PdfReader(path).pages, len(reader.pages)
+- Metadata: reader.metadata (title, author, etc.)
+`;
 
-## Unsupported Request Handling
+const SKILL_WORD = `## Loaded Skill: Word Document Processing
+- Read: from docx import Document; doc = Document(path)
+- Extract text: [p.text for p in doc.paragraphs]
+- Extract tables: doc.tables → table.rows, row.cells
+- Convert to PDF: Read content with python-docx, render with matplotlib PdfPages (see PDF Generation skill)
+`;
 
-If the user asks something you cannot do (e.g., send emails, browse the internet, access real-time data, communicate with external services):
-1. Politely say: "抱歉，暂不支持这个操作。" (or English equivalent)
-2. Call suggest_actions with 2-3 things the user CAN do with their current files
-3. If no files are uploaded, suggest uploading files first
-4. Never show raw error messages or expose technical limitations to the user`;
+const SKILL_EXCEL = `## Loaded Skill: Excel Processing
+- Read all sheets: pd.read_excel(path, sheet_name=None) → dict of DataFrames
+- Single sheet: pd.read_excel(path, sheet_name='Sheet1')
+- To Markdown: df.to_markdown(tablefmt='pipe')
+- Statistics: df.describe() per sheet
+- Charts: matplotlib from DataFrame data
+- Export CSV: df.to_csv(path, index=False)
+`;
+
+const SKILL_VIDEO = `## Loaded Skill: Video Processing
+- Metadata: ffprobe -v quiet -print_format json -show_format -show_streams <file>
+- Thumbnail: ffmpeg -i <file> -ss 00:00:01 -vframes 1 /tmp/thumb.jpg
+- Info extraction: duration, resolution, codec, bitrate, fps from ffprobe JSON
+- Note: Cannot transcode or edit video content in this environment, only extract metadata/thumbnails.
+`;
+
+const SKILL_PDF_GENERATION = `## Loaded Skill: PDF Generation (Chinese Content)
+When generating PDF with Chinese text, use matplotlib + PdfPages (NOT fpdf2):
+\`\`\`python
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.font_manager import FontProperties
+
+font = FontProperties(fname='/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc')
+
+with PdfPages('/tmp/report.pdf') as pdf:
+    fig, ax = plt.subplots(figsize=(8.27, 11.69))  # A4
+    ax.axis('off')
+    ax.text(0.5, 0.95, 'Title', fontsize=16, fontproperties=font, ha='center', va='top')
+    ax.text(0.05, 0.85, 'Content...', fontsize=10, fontproperties=font, va='top', wrap=True)
+    pdf.savefig(fig)
+    plt.close()
+\`\`\`
+- Tables in PDF: use ax.table() from matplotlib
+- fpdf2 with Helvetica is OK for English-only content
+- DO NOT use fpdf2 for Chinese (TTC font = garbled output)
+- After generating PDF, IMMEDIATELY call deliver_file
+`;
+
+const SKILL_MIXED = `## Loaded Skill: Multi-File Operations
+When processing multiple files together:
+- Cross-file analysis: Read all files, find connections/patterns, generate unified insights
+- Merge into PDF: Combine content from all files into one structured report
+- Compare: Diff or contrast data across files
+- Summary report: Extract key info from each file, synthesize into cohesive analysis
+- Process sequentially, report progress for each file
+`;
+
+const SKILL_TEXT = `## Loaded Skill: Text/Markdown/JSON Processing
+- Read content: Use files tool (op: read) or code_interpreter
+- Summarize: Extract key points, generate concise summary
+- Reformat: Convert between Markdown/JSON/plain text formats
+- Translate: Translate content between languages
+- Analyze structure: For JSON, parse and describe schema; for Markdown, extract headings/sections
+- Word count, character count, readability analysis
+- Convert to PDF: Render text content as formatted PDF (use matplotlib PdfPages for Chinese)
+`;
+
+/** Build system prompt dynamically based on uploaded file types */
+function buildSystemPrompt(files: Array<{name: string}>, sandboxWorking: boolean): string {
+  const skills = new Set<string>();
+
+  for (const file of files) {
+    const ext = file.name.split('.').pop()?.toLowerCase() || '';
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) skills.add('image');
+    else if (['csv'].includes(ext)) skills.add('csv');
+    else if (['pdf'].includes(ext)) skills.add('pdf');
+    else if (['doc', 'docx'].includes(ext)) skills.add('word');
+    else if (['xls', 'xlsx'].includes(ext)) skills.add('excel');
+    else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext)) skills.add('video');
+    else if (['md', 'txt', 'json', 'xml', 'html', 'log', 'yml', 'yaml'].includes(ext)) skills.add('text');
+    else skills.add('text'); // unknown extensions → text skill
+  }
+
+  // Multiple file types → load mixed skill
+  if (skills.size > 1) skills.add('mixed');
+
+  // PDF generation skill loaded when user might want PDF output
+  const needsPdfGen = skills.has('csv') || skills.has('excel') || skills.has('mixed') || skills.has('word') || skills.has('text') || skills.has('pdf');
+
+  let prompt = BASE_PROMPT;
+  if (skills.has('image')) prompt += '\n\n' + SKILL_IMAGE;
+  if (skills.has('csv')) prompt += '\n\n' + SKILL_CSV;
+  if (skills.has('pdf')) prompt += '\n\n' + SKILL_PDF;
+  if (skills.has('word')) prompt += '\n\n' + SKILL_WORD;
+  if (skills.has('excel')) prompt += '\n\n' + SKILL_EXCEL;
+  if (skills.has('video')) prompt += '\n\n' + SKILL_VIDEO;
+  if (skills.has('text')) prompt += '\n\n' + SKILL_TEXT;
+  if (skills.has('mixed')) prompt += '\n\n' + SKILL_MIXED;
+  if (needsPdfGen) prompt += '\n\n' + SKILL_PDF_GENERATION;
+
+  if (!sandboxWorking) {
+    prompt += `\n\n## IMPORTANT: Sandbox Unavailable Mode
+The sandbox is NOT available. File contents have been inlined in the message.
+- Do NOT call commands, files, or code_interpreter — they will fail.
+- Analyze content directly from the message text.
+- Only suggest text-based operations (summarize, analyze, compare, translate).
+- You MUST still call suggest_actions to present options.`;
+  }
+
+  const loadedSkills = Array.from(skills).join(', ');
+  logger.log(`[prompt] skills loaded: ${loadedSkills}, pdfGen: ${needsPdfGen}, sandbox: ${sandboxWorking}`);
+
+  return prompt;
+}
 
 // Tool definitions for Anthropic SDK
 const TOOLS: Anthropic.Tool[] = [
@@ -250,101 +303,45 @@ const TOOLS: Anthropic.Tool[] = [
   },
 ];
 
-/** Helper: get tool executor from context.tools MCP server */
+/**
+ * Helper: build tool executor from context.tools
+ * Per docs: use context.tools.get(name).execute(args) — tools are atomic (files_read, files_write, etc.)
+ * Result format: {content: [{type:'text', text:'...'}]} or plain string
+ */
 function buildToolExecutors(context: any): { execute: (name: string, args: Record<string, any>) => Promise<string>; ready: boolean } {
-  // Try toClaudeMcpServer() first (recommended by platform docs)
-  try {
-    const mcpBundle = context.tools?.toClaudeMcpServer?.();
-    if (mcpBundle && mcpBundle.tools && mcpBundle.tools.length > 0) {
-      const toolMap = new Map<string, any>();
-      for (const tool of mcpBundle.tools) {
-        const name = tool.name || '';
-        toolMap.set(name, tool);
+  if (typeof context.tools?.get !== 'function') {
+    logger.error('[tools] context.tools.get not available');
+    return { execute: async () => { throw new Error('No tools available'); }, ready: false };
+  }
+
+  // Verify at least one key tool exists
+  const cmdTool = context.tools.get('commands');
+  if (!cmdTool) {
+    logger.error('[tools] commands tool not found');
+    return { execute: async () => { throw new Error('No tools available'); }, ready: false };
+  }
+
+  const toolNames = context.tools.all?.()?.map((t: any) => t.name).join(', ') || 'unknown';
+  logger.log(`[tools] ready via context.tools.get(), available: ${toolNames}`);
+
+  return {
+    ready: true,
+    execute: async (name: string, args: Record<string, any>): Promise<string> => {
+      const tool = context.tools.get(name);
+      if (!tool || typeof tool.execute !== 'function') {
+        throw new Error(`Tool "${name}" not found`);
       }
-      logger.log(`[tools] MCP bundle ready: ${mcpBundle.name}, tools: ${Array.from(toolMap.keys()).join(', ')}`);
-
-      return {
-        ready: true,
-        execute: async (name: string, args: Record<string, any>): Promise<string> => {
-          const tool = toolMap.get(name);
-          if (!tool) throw new Error(`Tool "${name}" not found in MCP bundle`);
-          const handler = tool.execute || tool.handler || tool.invoke;
-          if (typeof handler !== 'function') throw new Error(`Tool "${name}" has no executor`);
-          const result = await handler(args);
-          if (typeof result === 'string') return result;
-          if (result?.content) {
-            if (Array.isArray(result.content)) {
-              return result.content.map((c: any) => c.text || JSON.stringify(c)).join('');
-            }
-            return String(result.content);
-          }
-          return JSON.stringify(result, null, 2);
-        },
-      };
-    }
-  } catch (e) {
-    logger.log(`[tools] toClaudeMcpServer() failed: ${(e as Error).message}`);
-  }
-
-  // Fallback: use context.tools.get() directly
-  if (typeof context.tools?.get === 'function') {
-    logger.log('[tools] using context.tools.get() fallback');
-    return {
-      ready: true,
-      execute: async (name: string, args: Record<string, any>): Promise<string> => {
-        let tool = context.tools.get(name);
-        // Retry with alternate naming (e.g., files_list, files_read)
-        if (!tool || typeof tool.execute !== 'function') {
-          // Try without underscores or with different casing
-          tool = context.tools.get(name.replace(/_/g, '-'));
+      const result = await tool.execute(args);
+      if (typeof result === 'string') return result;
+      if (result?.content) {
+        if (Array.isArray(result.content)) {
+          return result.content.map((c: any) => c.text || JSON.stringify(c)).join('');
         }
-        if (!tool || typeof tool.execute !== 'function') {
-          throw new Error(`Tool "${name}" not available via context.tools.get()`);
-        }
-        const result = await tool.execute(args);
-        if (typeof result === 'string') return result;
-        if (result?.content) {
-          if (Array.isArray(result.content)) {
-            return result.content.map((c: any) => c.text || JSON.stringify(c)).join('');
-          }
-          return String(result.content);
-        }
-        return JSON.stringify(result, null, 2);
-      },
-    };
-  }
-
-  // Last resort: try context.tools.all()
-  const allTools = context.tools?.all?.() ?? [];
-  if (allTools.length > 0) {
-    logger.log(`[tools] using context.tools.all() fallback, found ${allTools.length} tools`);
-    const toolMap = new Map<string, any>();
-    for (const item of allTools) {
-      const name = item.name || item.function?.name;
-      if (name) toolMap.set(name, item);
-    }
-    return {
-      ready: true,
-      execute: async (name: string, args: Record<string, any>): Promise<string> => {
-        const tool = toolMap.get(name);
-        if (!tool) throw new Error(`Tool "${name}" not found`);
-        const exec = tool.execute || tool.handler || tool.invoke;
-        if (typeof exec !== 'function') throw new Error(`Tool "${name}" has no executor`);
-        const result = await exec.call(tool, args);
-        if (typeof result === 'string') return result;
-        if (result?.content) {
-          if (Array.isArray(result.content)) {
-            return result.content.map((c: any) => c.text || JSON.stringify(c)).join('');
-          }
-          return String(result.content);
-        }
-        return JSON.stringify(result, null, 2);
-      },
-    };
-  }
-
-  logger.error('[tools] no tool executors available');
-  return { execute: async () => { throw new Error('No tools available'); }, ready: false };
+        return String(result.content);
+      }
+      return JSON.stringify(result, null, 2);
+    },
+  };
 }
 
 function shellQuote(value: string): string {
@@ -450,20 +447,33 @@ export async function onRequest(context: any) {
   // Build tool executors from context.tools MCP bundle
   const toolBundle = buildToolExecutors(context);
 
+  // Direct sandbox access (faster, bypasses MCP tool layer)
+  const sandbox = context.sandbox ?? null;
+
   // Write uploaded files to sandbox before starting the Agent
   let sandboxWorking = false;
-  if (uploadedFiles.length > 0 && toolBundle.ready) {
-    // Test sandbox readiness — use 'commands' (always available), NOT 'files' (split into files_read etc.)
+  if (uploadedFiles.length > 0 && (toolBundle.ready || sandbox)) {
+    // Test sandbox readiness — prefer direct sandbox API
     try {
-      await toolBundle.execute('commands', { cmd: 'ls /tmp' });
-      sandboxWorking = true;
-      logger.log('[sandbox] ready');
+      if (sandbox?.commands?.run) {
+        await sandbox.commands.run('ls /tmp', { timeout: 10 });
+        sandboxWorking = true;
+        logger.log('[sandbox] ready (direct API)');
+      } else {
+        await toolBundle.execute('commands', { cmd: 'ls /tmp' });
+        sandboxWorking = true;
+        logger.log('[sandbox] ready (via tools)');
+      }
     } catch (e) {
       // Retry with delay
-      for (let attempt = 0; attempt < 3; attempt++) {
-        await new Promise((r) => setTimeout(r, 3000));
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await new Promise((r) => setTimeout(r, 2000));
         try {
-          await toolBundle.execute('commands', { cmd: 'ls /tmp' });
+          if (sandbox?.commands?.run) {
+            await sandbox.commands.run('ls /tmp', { timeout: 10 });
+          } else {
+            await toolBundle.execute('commands', { cmd: 'ls /tmp' });
+          }
           sandboxWorking = true;
           logger.log(`[sandbox] ready (after ${attempt + 1} retries)`);
           break;
@@ -479,77 +489,73 @@ export async function onRequest(context: any) {
           const sandboxPath = `/tmp/${file.name}`;
           let uploadSuccess = false;
 
-          // Method 1: Use code_interpreter (Python) — most reliable for all filenames and sizes
-          try {
-            // Split base64 into chunks small enough for code_interpreter input
-            const b64 = file.base64;
-            const pyChunkSize = 200_000;
-            if (b64.length <= pyChunkSize) {
-              await toolBundle.execute('code_interpreter', {
-                language: 'python',
-                code: `import base64\ndata = base64.b64decode("${b64}")\nwith open("${sandboxPath}", "wb") as f:\n    f.write(data)\nprint(f"Written {len(data)} bytes")`,
-              });
-            } else {
-              // Write base64 string in chunks, then decode
-              const totalChunks = Math.ceil(b64.length / pyChunkSize);
-              let pyCode = `import base64\nb64_str = ""\n`;
-              // Write chunks to a temp file to avoid huge Python string
-              await toolBundle.execute('code_interpreter', {
-                language: 'python',
-                code: `open("/tmp/__upload_b64.txt", "w").close()`,
-              });
-              for (let i = 0; i < totalChunks; i++) {
-                const chunk = b64.slice(i * pyChunkSize, (i + 1) * pyChunkSize);
-                await toolBundle.execute('code_interpreter', {
-                  language: 'python',
-                  code: `with open("/tmp/__upload_b64.txt", "a") as f:\n    f.write("${chunk}")`,
-                });
-              }
-              await toolBundle.execute('code_interpreter', {
-                language: 'python',
-                code: `import base64, os\nwith open("/tmp/__upload_b64.txt", "r") as f:\n    b64_str = f.read()\ndata = base64.b64decode(b64_str)\nwith open("${sandboxPath}", "wb") as f:\n    f.write(data)\nos.remove("/tmp/__upload_b64.txt")\nprint(f"Written {len(data)} bytes to ${sandboxPath}")`,
-              });
+          // Helper: run a shell command via the best available method
+          const runCmd = async (cmd: string): Promise<string> => {
+            if (sandbox?.commands?.run) {
+              const r = await sandbox.commands.run(cmd, { timeout: 30 });
+              return r.stdout || '';
             }
+            const r = await toolBundle.execute('commands', { cmd });
+            try { return JSON.parse(r).stdout || ''; } catch { return r; }
+          };
+
+          // Helper: write text to sandbox file
+          const writeText = async (path: string, content: string): Promise<void> => {
+            if (sandbox?.files?.write) {
+              await sandbox.files.write(path, content);
+            } else {
+              await toolBundle.execute('files_write', { path, content });
+            }
+          };
+
+          // Strategy: write base64 as text file → decode with shell command
+          // sandbox.files.write() accepts strings, perfect for base64 text
+          try {
+            const b64TmpPath = '/tmp/__upload_b64.tmp';
+            await writeText(b64TmpPath, file.base64);
+            await runCmd(`base64 -d ${b64TmpPath} > ${shellQuote(sandboxPath)} && rm -f ${b64TmpPath}`);
 
             // Verify
-            const verifyResult = await toolBundle.execute('commands', { cmd: `stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo MISSING` });
-            const verifyStr = typeof verifyResult === 'string' ? verifyResult : JSON.stringify(verifyResult);
-            if (!verifyStr.includes('MISSING') && !verifyStr.includes('"stdout":""') && !verifyStr.includes('"stdout":"0\n"')) {
+            const sizeStr = await runCmd(`stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`);
+            const fileSize = parseInt(sizeStr.trim(), 10) || 0;
+            if (fileSize > 0) {
               uploadSuccess = true;
+              logger.log(`[upload] success via files.write+decode: ${sandboxPath} (${fileSize} bytes)`);
             }
           } catch (e) {
-            logger.log(`[upload] Python method failed for ${file.name}: ${(e as Error).message}`);
+            logger.log(`[upload] files.write method failed: ${(e as Error).message}`);
           }
 
-          // Method 2 fallback: Use shell commands
+          // Fallback: use runCode (Python) if files.write approach failed
           if (!uploadSuccess) {
             try {
-              if (file.base64.length > 500_000) {
-                const chunkSize = 400_000;
+              const runCode = sandbox?.runCode
+                ? (code: string) => sandbox.runCode(code, { language: 'python' })
+                : (code: string) => toolBundle.execute('code_interpreter', { language: 'python', code });
+
+              // For small files, do it in one shot
+              if (file.base64.length <= 150_000) {
+                await runCode(`import base64\nwith open("${sandboxPath}", "wb") as f:\n    f.write(base64.b64decode("${file.base64}"))\nprint("ok")`);
+              } else {
+                // Write base64 chunks to temp file, then decode
+                const chunkSize = 150_000;
                 const totalChunks = Math.ceil(file.base64.length / chunkSize);
-                await toolBundle.execute('commands', { cmd: `> ${shellQuote(sandboxPath)}.b64` });
+                await runCode(`open("/tmp/__b64tmp", "w").close()`);
                 for (let i = 0; i < totalChunks; i++) {
                   const chunk = file.base64.slice(i * chunkSize, (i + 1) * chunkSize);
-                  await toolBundle.execute('commands', {
-                    cmd: `printf %s ${shellQuote(chunk)} >> ${shellQuote(sandboxPath)}.b64`,
-                  });
+                  await runCode(`open("/tmp/__b64tmp", "a").write("${chunk}")`);
                 }
-                await toolBundle.execute('commands', {
-                  cmd: `base64 -d ${shellQuote(sandboxPath)}.b64 > ${shellQuote(sandboxPath)} && rm -f ${shellQuote(sandboxPath)}.b64`,
-                });
-              } else {
-                await toolBundle.execute('commands', {
-                  cmd: `printf %s ${shellQuote(file.base64)} | base64 -d > ${shellQuote(sandboxPath)}`,
-                });
+                await runCode(`import base64, os\nwith open("/tmp/__b64tmp") as f:\n    d = base64.b64decode(f.read())\nwith open("${sandboxPath}", "wb") as f:\n    f.write(d)\nos.remove("/tmp/__b64tmp")\nprint(len(d))`);
               }
 
-              const verifyResult = await toolBundle.execute('commands', { cmd: `stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo MISSING` });
-              const verifyStr = typeof verifyResult === 'string' ? verifyResult : JSON.stringify(verifyResult);
-              if (!verifyStr.includes('MISSING') && !verifyStr.includes('"stdout":""') && !verifyStr.includes('"stdout":"0\n"')) {
+              const sizeStr = await runCmd(`stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`);
+              const fileSize = parseInt(sizeStr.trim(), 10) || 0;
+              if (fileSize > 0) {
                 uploadSuccess = true;
+                logger.log(`[upload] success via runCode: ${sandboxPath} (${fileSize} bytes)`);
               }
-            } catch (e2) {
-              logger.log(`[upload] Shell method also failed for ${file.name}: ${(e2 as Error).message}`);
+            } catch (e) {
+              logger.log(`[upload] runCode method failed: ${(e as Error).message}`);
             }
           }
 
@@ -558,25 +564,16 @@ export async function onRequest(context: any) {
             sandboxWorking = false;
             break;
           }
-          logger.log(`[upload] verified: ${sandboxPath} (${(file.base64.length / 1024).toFixed(0)}KB b64)`);
         } catch (e) {
-          logger.error(`[upload] failed to write /tmp/${file.name}:`, (e as Error).message);
+          logger.error(`[upload] failed for ${file.name}:`, (e as Error).message);
           sandboxWorking = false;
           break;
         }
       }
     }
 
-    // Pre-install Python packages
+    // Tell the AI files are ready — no need to list /tmp
     if (sandboxWorking) {
-      try {
-        await toolBundle.execute('commands', { cmd: 'pip install -q tabulate fpdf2 openpyxl python-docx matplotlib 2>/dev/null || true' });
-        logger.log('[sandbox] pre-installed Python packages');
-      } catch (e) {
-        logger.log('[sandbox] pip pre-install skipped:', (e as Error).message);
-      }
-
-      // Tell the AI files are ready — no need to list /tmp
       const fileList = uploadedFiles.map(f => `/tmp/${f.name}`).join(', ');
       message = message + `\n\n[系统提示：文件已就绪，路径为: ${fileList}。请直接分析和处理，不需要先 list 目录确认。]`;
     }
@@ -611,9 +608,7 @@ export async function onRequest(context: any) {
   }
 
   // Build Anthropic client
-  // Strip trailing /v1 — SDK appends it automatically
-  let baseURL = process.env.AI_GATEWAY_BASE_URL || "";
-  baseURL = baseURL.replace(/\/v1\/?$/, "");
+  const baseURL = process.env.AI_GATEWAY_BASE_URL || "";
 
   const client = new Anthropic({
     apiKey: process.env.AI_GATEWAY_API_KEY!,
@@ -635,6 +630,8 @@ export async function onRequest(context: any) {
     let totalOutput = 0;
     let turnCount = 0;
     const maxTurns = 15;
+    let suggestActionsCalled = false;
+    let deliverFileCalled = false;
 
     while (turnCount < maxTurns) {
       turnCount++;
@@ -643,14 +640,8 @@ export async function onRequest(context: any) {
       let response: Anthropic.Message;
       // When sandbox is unavailable, only expose suggest_actions tool
       const activeTools = sandboxWorking ? TOOLS : TOOLS.filter(t => t.name === 'suggest_actions');
-      const systemPrompt = sandboxWorking ? SYSTEM_PROMPT : SYSTEM_PROMPT + `
-
-## IMPORTANT: Sandbox Unavailable Mode
-The sandbox is NOT available in this session. File contents have been inlined in the user message.
-- Do NOT call commands, files, or code_interpreter tools — they will fail.
-- Analyze the file content directly from the message text.
-- For suggest_actions, only suggest text-based operations (summarize, analyze, compare, extract key points, translate). Do NOT suggest PDF generation, format conversion, or chart creation.
-- You MUST still call suggest_actions to present follow-up options after your analysis.`;
+      // Build dynamic prompt based on file types (skills architecture)
+      const systemPrompt = buildSystemPrompt(uploadedFiles, sandboxWorking);
       try {
         response = await client.messages.create({
           model,
@@ -723,12 +714,14 @@ The sandbox is NOT available in this session. File contents have been inlined in
           try {
             if (toolName === 'suggest_actions') {
               // Custom tool: emit structured suggestion card to frontend
+              suggestActionsCalled = true;
               yield sseEvent({
                 type: "suggest_actions",
                 actions: toolInput.actions || [],
               });
               resultText = 'Suggestions have been displayed to the user. Wait for them to choose an action.';
             } else if (toolName === 'deliver_file') {
+              deliverFileCalled = true;
               // Custom tool: read file as base64 via commands tool and deliver to user
               const b64Result = await toolBundle.execute('commands', { cmd: `base64 -w 0 ${toolInput.path}` });
               let base64Content = '';
@@ -756,13 +749,9 @@ The sandbox is NOT available in this session. File contents have been inlined in
               resultText = await toolBundle.execute(toolName, toolInput);
             }
 
-            // Truncate excessively long tool results to prevent request body overflow
-            if (resultText.length > 8000) {
-              resultText = resultText.slice(0, 8000) + '\n...[truncated, result too long]';
-            }
             logger.log(`[tool] ${toolName} success, result length: ${resultText.length}`);
 
-            // Check if this is a file delivery result
+            // Check if this is a file delivery result (BEFORE truncation — base64 is large)
             if (resultText.includes("__file_output__")) {
               try {
                 const fileData = JSON.parse(resultText);
@@ -778,6 +767,12 @@ The sandbox is NOT available in this session. File contents have been inlined in
               } catch {
                 /* not valid JSON, treat as normal result */
               }
+            }
+
+            // Truncate excessively long tool results to prevent request body overflow
+            // (applied AFTER file_output extraction so base64 data isn't lost)
+            if (resultText.length > 8000) {
+              resultText = resultText.slice(0, 8000) + '\n...[truncated, result too long]';
             }
 
             // For code_interpreter, emit only clean stdout for the user to see
@@ -839,6 +834,61 @@ The sandbox is NOT available in this session. File contents have been inlined in
       const fallbackMsg = '\n\n⚠️ 处理超时，请尝试简化操作或重新上传文件。';
       yield sseEvent({ type: "text_delta", delta: fallbackMsg });
       fullAssistantText += fallbackMsg;
+    }
+
+    // FALLBACK: If AI didn't call suggest_actions and didn't deliver a file, auto-generate suggestions
+    if (!suggestActionsCalled && !deliverFileCalled && uploadedFiles.length > 0) {
+      logger.log('[fallback] AI did not call suggest_actions, generating default suggestions');
+      const fileTypes = new Set(uploadedFiles.map(f => {
+        const ext = f.name.split('.').pop()?.toLowerCase() || '';
+        if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return 'image';
+        if (['pdf'].includes(ext)) return 'pdf';
+        if (['doc', 'docx'].includes(ext)) return 'word';
+        if (['xls', 'xlsx'].includes(ext)) return 'excel';
+        if (['csv'].includes(ext)) return 'csv';
+        if (['mp4', 'mov', 'avi', 'mkv'].includes(ext)) return 'video';
+        return 'text';
+      }));
+
+      const defaultActions: Array<{ id: string; emoji: string; title: string; description: string }> = [];
+      if (fileTypes.has('image')) {
+        defaultActions.push(
+          { id: 'a1', emoji: '🔄', title: '格式转换', description: '将图片转换为 PNG、WebP 等其他格式' },
+          { id: 'a2', emoji: '📦', title: '压缩图片', description: '压缩图片文件大小，优化存储' },
+          { id: 'a3', emoji: '🔍', title: 'OCR 文字识别', description: '识别图片中的文字内容' },
+          { id: 'a4', emoji: '📐', title: '调整尺寸', description: '调整图片尺寸或裁剪' },
+        );
+      } else if (fileTypes.has('pdf')) {
+        defaultActions.push(
+          { id: 'a1', emoji: '📝', title: '提取文字', description: '从 PDF 中提取全部文本内容' },
+          { id: 'a2', emoji: '📊', title: '提取表格', description: '提取 PDF 中的表格数据' },
+          { id: 'a3', emoji: '📋', title: '生成摘要', description: '总结 PDF 文档的核心内容' },
+          { id: 'a4', emoji: '🔗', title: '合并 PDF', description: '与其他 PDF 文件合并' },
+        );
+      } else if (fileTypes.has('word')) {
+        defaultActions.push(
+          { id: 'a1', emoji: '📄', title: '转换为 PDF', description: '将 Word 文档转换为 PDF 格式' },
+          { id: 'a2', emoji: '📝', title: '提取文字', description: '提取文档中的全部文本' },
+          { id: 'a3', emoji: '📊', title: '提取表格', description: '提取文档中的表格数据' },
+          { id: 'a4', emoji: '📋', title: '内容摘要', description: '生成文档核心内容摘要' },
+        );
+      } else if (fileTypes.has('csv') || fileTypes.has('excel')) {
+        defaultActions.push(
+          { id: 'a1', emoji: '📊', title: '数据分析', description: '统计分析并生成摘要' },
+          { id: 'a2', emoji: '📈', title: '生成图表', description: '将数据可视化为图表' },
+          { id: 'a3', emoji: '📄', title: '导出 PDF 报告', description: '生成格式化的 PDF 数据报告' },
+        );
+      } else {
+        // text/md/json/etc.
+        defaultActions.push(
+          { id: 'a1', emoji: '📋', title: '内容摘要', description: '提取核心内容生成摘要' },
+          { id: 'a2', emoji: '📄', title: '转换为 PDF', description: '将文本内容排版为 PDF 文件' },
+          { id: 'a3', emoji: '🔍', title: '结构分析', description: '分析文件结构和关键信息' },
+          { id: 'a4', emoji: '🌐', title: '翻译', description: '将内容翻译为其他语言' },
+        );
+      }
+
+      yield sseEvent({ type: "suggest_actions", actions: defaultActions });
     }
 
     // Emit usage

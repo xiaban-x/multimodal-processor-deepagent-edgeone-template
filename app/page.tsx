@@ -330,6 +330,18 @@ export default function Home() {
       if (pendingSuggestions) {
         addActivity('suggestions', '', { actions: pendingSuggestions });
       } else {
+        // Clean up trailing "recommendation intro" text if AI wrote it without calling the tool
+        setActivities((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.type === 'text' && last.content) {
+            // Remove trailing lines that introduce suggestions that never came
+            const cleaned = last.content.replace(/\n*(?:以下是|请选择|请点击|点击上方|您可以选择|推荐的处理方案|以下是为您推荐)[\s\S]*$/, '').trim();
+            if (cleaned !== last.content && cleaned) {
+              return prev.map((a) => a.id === last.id ? { ...a, content: cleaned } : a);
+            }
+          }
+          return prev;
+        });
         addActivity('system', t.taskComplete);
       }
     } catch (err) {
