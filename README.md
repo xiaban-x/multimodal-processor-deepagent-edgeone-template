@@ -74,7 +74,7 @@ AI_GATEWAY_BASE_URL=your_base_url
 EOF
 
 # Start development server
-edgeone pages dev
+edgeone makers dev
 ```
 
 ### Development
@@ -84,7 +84,7 @@ edgeone pages dev
 npx tsc --noEmit
 
 # Build
-npm run build
+edgeone makers build
 
 # Test sandbox connectivity
 curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/json' -d '{}'
@@ -95,7 +95,7 @@ curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/js
 Deploy to EdgeOne Makers:
 
 ```bash
-edgeone pages deploy
+edgeone makers deploy
 ```
 
 Sandbox credentials and project ID are automatically injected by the deployment pipeline. No manual configuration needed.

@@ -74,7 +74,7 @@ AI_GATEWAY_BASE_URL=your_base_url
 EOF
 
 # 启动开发服务器
-edgeone pages dev
+edgeone makers dev
 ```
 
 ### 开发
@@ -84,7 +84,7 @@ edgeone pages dev
 npx tsc --noEmit
 
 # 构建
-npm run build
+edgeone makers build
 
 # 测试沙箱连通性
 curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/json' -d '{}'
@@ -95,7 +95,7 @@ curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/js
 部署到 EdgeOne Makers：
 
 ```bash
-edgeone pages deploy
+edgeone makers deploy
 ```
 
 沙箱凭证和项目 ID 由部署流水线自动注入，无需手动配置。
