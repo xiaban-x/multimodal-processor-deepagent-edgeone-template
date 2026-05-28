@@ -1,6 +1,6 @@
 # 多模态文件处理助手
 
-基于 EdgeOne Makes 的 AI 文档处理 Agent。支持上传 PDF、Word、Excel、图片、视频、CSV、文本文件，自动分析并提供智能处理选项。
+基于 EdgeOne Makers 的 AI 文档处理 Agent。支持上传 PDF、Word、Excel、图片、视频、CSV、文本文件，自动分析并提供智能处理选项。
 
 ## 功能特性
 
@@ -92,7 +92,7 @@ curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/js
 
 ## 部署
 
-部署到 EdgeOne Makes：
+部署到 EdgeOne Makers：
 
 ```bash
 edgeone pages deploy
@@ -109,7 +109,7 @@ edgeone pages deploy
 
 ## 技术栈
 
-- **运行时**：EdgeOne Makes Agent（云函数 + 沙箱）
+- **运行时**：EdgeOne Makers Agent（云函数 + 沙箱）
 - **前端**：Next.js 16 + React 19 + Tailwind CSS
 - **AI**：Anthropic SDK（`@anthropic-ai/sdk`）手写 tool-use 循环
 - **沙箱**：EdgeOne Sandbox（code_interpreter、commands、files）

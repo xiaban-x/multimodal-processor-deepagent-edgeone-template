@@ -1,5 +1,5 @@
 /**
- * Document Processing Agent — EdgeOne Makes Functions
+ * Document Processing Agent — EdgeOne Makers Functions
  * ====================================================
  *
  * File path: agents/chat/index.ts → maps to **POST /chat**

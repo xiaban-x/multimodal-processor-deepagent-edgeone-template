@@ -1,6 +1,6 @@
 # Multimodal File Processor
 
-AI-powered document processing agent built on EdgeOne Makes. Upload files (PDF, Word, Excel, images, video, CSV, text) and get intelligent analysis with interactive processing options.
+AI-powered document processing agent built on EdgeOne Makers. Upload files (PDF, Word, Excel, images, video, CSV, text) and get intelligent analysis with interactive processing options.
 
 ## Features
 
@@ -92,7 +92,7 @@ curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/js
 
 ## Deployment
 
-Deploy to EdgeOne Makes:
+Deploy to EdgeOne Makers:
 
 ```bash
 edgeone pages deploy
@@ -109,7 +109,7 @@ Sandbox credentials and project ID are automatically injected by the deployment 
 
 ## Tech Stack
 
-- **Runtime**: EdgeOne Makes Agent (Cloud Functions + Sandbox)
+- **Runtime**: EdgeOne Makers Agent (Cloud Functions + Sandbox)
 - **Frontend**: Next.js 16 + React 19 + Tailwind CSS
 - **AI**: Anthropic SDK (`@anthropic-ai/sdk`) with manual tool-use loop
 - **Sandbox**: EdgeOne sandbox (code_interpreter, commands, files)
