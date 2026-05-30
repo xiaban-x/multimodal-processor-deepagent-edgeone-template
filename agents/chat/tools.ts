@@ -1,152 +1,9 @@
 /**
- * Tool definitions and executor helpers for the document processing agent.
+ * Shared utilities for the document processing agent.
+ * (TOOLS array and buildToolExecutors removed — now handled by Claude Agent SDK + MCP servers)
  */
 
-import Anthropic from "@anthropic-ai/sdk";
-import { createLogger } from "../_shared";
-
-const logger = createLogger("tools");
-
-/** Tool definitions exposed to the Anthropic model */
-export const TOOLS: Anthropic.Tool[] = [
-  {
-    name: "commands",
-    description:
-      "Execute shell commands in the sandbox (e.g., ffprobe, ls, cat)",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        cmd: { type: "string", description: "Shell command to execute" },
-        cwd: { type: "string", description: "Working directory (optional)" },
-      },
-      required: ["cmd"],
-    },
-  },
-  {
-    name: "files",
-    description:
-      "File operations in the sandbox — read, write, list, makeDir, exists, remove",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        op: {
-          type: "string",
-          enum: ["read", "write", "list", "exists", "remove", "makeDir"],
-          description: "File operation",
-        },
-        path: { type: "string", description: "File or directory path" },
-        content: { type: "string", description: "Content for write operation" },
-      },
-      required: ["op", "path"],
-    },
-  },
-  {
-    name: "code_interpreter",
-    description:
-      "Run code in an isolated interpreter. Supports python, javascript, bash.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        language: {
-          type: "string",
-          enum: ["python", "javascript", "bash"],
-          description: "Language to execute",
-        },
-        code: { type: "string", description: "Code to execute" },
-      },
-      required: ["language", "code"],
-    },
-  },
-  {
-    name: "deliver_file",
-    description:
-      "Deliver a processed file to the user for download. Call this after generating an output file (e.g., merged PDF, converted document). The file will be sent as a downloadable link.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        path: {
-          type: "string",
-          description: "Path to the output file in sandbox (e.g., /tmp/merged.pdf)",
-        },
-        filename: {
-          type: "string",
-          description: "Display filename for the user (e.g., merged-report.pdf)",
-        },
-        description: {
-          type: "string",
-          description: "Brief description of the file content",
-        },
-      },
-      required: ["path", "filename"],
-    },
-  },
-  {
-    name: "suggest_actions",
-    description:
-      "Present a list of recommended actions to the user as clickable options. Use this when you've analyzed files and want to suggest processing options.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        actions: {
-          type: "array",
-          description: "List of suggested actions",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string", description: "Unique action ID (e.g., action_1)" },
-              emoji: { type: "string", description: "Emoji icon for the action" },
-              title: { type: "string", description: "Short title (under 20 chars)" },
-              description: { type: "string", description: "Brief description of what this action does (1 sentence)" },
-            },
-            required: ["id", "emoji", "title", "description"],
-          },
-        },
-      },
-      required: ["actions"],
-    },
-  },
-];
-
-/**
- * Build tool executor from context.tools
- * Uses context.tools.get(name).execute(args) — tools are atomic (files_read, files_write, etc.)
- */
-export function buildToolExecutors(context: any): { execute: (name: string, args: Record<string, any>) => Promise<string>; ready: boolean } {
-  if (typeof context.tools?.get !== 'function') {
-    logger.error('[tools] context.tools.get not available');
-    return { execute: async () => { throw new Error('No tools available'); }, ready: false };
-  }
-
-  const cmdTool = context.tools.get('commands');
-  if (!cmdTool) {
-    logger.error('[tools] commands tool not found');
-    return { execute: async () => { throw new Error('No tools available'); }, ready: false };
-  }
-
-  const toolNames = context.tools.all?.()?.map((t: any) => t.name).join(', ') || 'unknown';
-  logger.log(`[tools] ready via context.tools.get(), available: ${toolNames}`);
-
-  return {
-    ready: true,
-    execute: async (name: string, args: Record<string, any>): Promise<string> => {
-      const tool = context.tools.get(name);
-      if (!tool || typeof tool.execute !== 'function') {
-        throw new Error(`Tool "${name}" not found`);
-      }
-      const result = await tool.execute(args);
-      if (typeof result === 'string') return result;
-      if (result?.content) {
-        if (Array.isArray(result.content)) {
-          return result.content.map((c: any) => c.text || JSON.stringify(c)).join('');
-        }
-        return String(result.content);
-      }
-      return JSON.stringify(result, null, 2);
-    },
-  };
-}
-
-/** Shell-safe quoting */
+/** Shell-safe single-quote wrapping */
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -169,4 +26,57 @@ export function canInlineFallbackFile(fileName: string, content: Buffer): boolea
   const decoded = content.toString('utf8');
   const replacementCount = decoded.match(/\uFFFD/g)?.length ?? 0;
   return replacementCount / Math.max(decoded.length, 1) < 0.01;
+}
+
+/** Default suggestions per file type for the fallback suggest_actions */
+type ActionItem = { id: string; emoji: string; title: string; description: string };
+
+export function buildDefaultActions(uploadedFiles: Array<{ name: string }>): ActionItem[] {
+  const fileTypes = new Set(uploadedFiles.map(f => {
+    const ext = f.name.split('.').pop()?.toLowerCase() || '';
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return 'image';
+    if (ext === 'pdf') return 'pdf';
+    if (['doc', 'docx'].includes(ext)) return 'word';
+    if (['xls', 'xlsx'].includes(ext)) return 'excel';
+    if (ext === 'csv') return 'csv';
+    return 'text';
+  }));
+
+  if (fileTypes.has('image')) {
+    return [
+      { id: 'a1', emoji: '🔄', title: '格式转换', description: '将图片转换为 PNG、WebP 等其他格式' },
+      { id: 'a2', emoji: '📦', title: '压缩图片', description: '压缩图片文件大小，优化存储' },
+      { id: 'a3', emoji: '📐', title: '调整尺寸', description: '调整图片尺寸或裁剪' },
+      { id: 'a4', emoji: '💧', title: '添加水印', description: '在图片上添加自定义文字水印' },
+    ];
+  }
+  if (fileTypes.has('pdf')) {
+    return [
+      { id: 'a1', emoji: '📝', title: '提取文字', description: '从 PDF 中提取全部文本内容' },
+      { id: 'a2', emoji: '📊', title: '提取表格', description: '提取 PDF 中的表格数据' },
+      { id: 'a3', emoji: '📋', title: '生成摘要', description: '总结 PDF 文档的核心内容' },
+      { id: 'a4', emoji: '🔗', title: '合并 PDF', description: '与其他 PDF 文件合并' },
+    ];
+  }
+  if (fileTypes.has('word')) {
+    return [
+      { id: 'a1', emoji: '📄', title: '转换为 PDF', description: '将 Word 文档转换为 PDF 格式' },
+      { id: 'a2', emoji: '📝', title: '提取文字', description: '提取文档中的全部文本' },
+      { id: 'a3', emoji: '📊', title: '提取表格', description: '提取文档中的表格数据' },
+      { id: 'a4', emoji: '📋', title: '内容摘要', description: '生成文档核心内容摘要' },
+    ];
+  }
+  if (fileTypes.has('csv') || fileTypes.has('excel')) {
+    return [
+      { id: 'a1', emoji: '📊', title: '数据分析', description: '统计分析并生成摘要' },
+      { id: 'a2', emoji: '📈', title: '生成图表', description: '将数据可视化为图表' },
+      { id: 'a3', emoji: '📄', title: '导出 PDF 报告', description: '生成格式化的 PDF 数据报告' },
+    ];
+  }
+  return [
+    { id: 'a1', emoji: '📋', title: '内容摘要', description: '提取核心内容生成摘要' },
+    { id: 'a2', emoji: '📄', title: '转换为 PDF', description: '将文本内容排版为 PDF 文件' },
+    { id: 'a3', emoji: '🔍', title: '结构分析', description: '分析文件结构和关键信息' },
+    { id: 'a4', emoji: '🌐', title: '翻译', description: '将内容翻译为其他语言' },
+  ];
 }

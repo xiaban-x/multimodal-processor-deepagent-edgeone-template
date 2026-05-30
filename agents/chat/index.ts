@@ -4,114 +4,101 @@
  *
  * File path: agents/chat/index.ts → maps to **POST /chat**
  *
- * Uses @anthropic-ai/sdk directly with manual tool-use loop.
- * Integrates EdgeOne sandbox tools (code_interpreter, commands, files).
+ * Uses @anthropic-ai/claude-agent-sdk with dual MCP server pattern:
+ *   1. EdgeOne sandbox MCP server  — code_interpreter, commands, files
+ *   2. Custom tools MCP server     — suggest_actions, deliver_file
  */
 
-import Anthropic from "@anthropic-ai/sdk";
-import { resolveModelName } from "../_model";
-import { createLogger, sseEvent, createSSEResponse } from "../_shared";
-import { buildSystemPrompt } from "./skills";
-import { TOOLS, buildToolExecutors, shellQuote, canInlineFallbackFile } from "./tools";
+import { query, createSdkMcpServer, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
+import { resolveModelName, collectGatewayEnv } from '../_model';
+import { createLogger, sseEvent, createSSEResponse } from '../_shared';
+import { buildSystemPrompt } from './skills';
+import { shellQuote, canInlineFallbackFile, buildDefaultActions } from './tools';
 
-const logger = createLogger("chat");
+const logger = createLogger('chat');
+
+// Prevent SDK stdout observability from crashing the process on EPIPE
+process.stdout.on('error', (err: any) => {
+  if (err.code === 'EPIPE') return; // ignore broken pipe
+});
+
+/** Normalize a string to a valid UUID or return null */
+function normalizeUuid(id: string): string | null {
+  if (!id) return null;
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRe.test(id)) return id.toLowerCase();
+  // Pad/truncate to a pseudo-UUID so sessions can be keyed by conversationId
+  const hex = id.replace(/[^0-9a-f]/gi, '').padEnd(32, '0').slice(0, 32);
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`;
+}
+
+/** Resolve session binding: resume existing session or create new one */
+async function resolveClaudeSessionBinding(
+  sessionStore: any,
+  conversationId: string,
+  cwd: string
+): Promise<{ resume?: string; sessionId?: string }> {
+  const sessionId = normalizeUuid(conversationId);
+  if (!sessionId) return {};
+  try {
+    const infoOptions: any = { dir: cwd };
+    if (sessionStore?.load) infoOptions.sessionStore = sessionStore;
+    const info = await getSessionInfo(sessionId, infoOptions);
+    if (info) {
+      logger.log(`[session] resuming existing session: ${sessionId}`);
+      return { resume: sessionId };
+    }
+  } catch {
+    // getSessionInfo may throw if session store is unavailable
+  }
+  logger.log(`[session] creating new session: ${sessionId}`);
+  return { sessionId };
+}
 
 export async function onRequest(context: any) {
+  const ctxEnv: Record<string, string | undefined> = context.env ?? process.env;
+
   const body = context.request.body ?? {};
-  let message = typeof body.message === "string" ? body.message.trim() : "";
-  const uploadedFiles: Array<{ name: string; base64: string }> =
-    body.files ?? [];
+  let message = typeof body.message === 'string' ? body.message.trim() : '';
+  const uploadedFiles: Array<{ name: string; base64: string }> = body.files ?? [];
+
+  // Detect user locale from the language hint appended by the frontend
+  const locale: 'zh' | 'en' = message.includes('[语言要求：') ? 'zh'
+    : message.includes('[Language:') ? 'en'
+    : 'en';
 
   if (!message) {
     return new Response(JSON.stringify({ error: "'message' is required" }), {
       status: 400,
-      headers: { "Content-Type": "application/json" },
+      headers: { 'Content-Type': 'application/json' },
     });
   }
 
   const signal: AbortSignal | undefined = context.request.signal;
-  // Use conversationId from request body (client-side), fallback to platform's
-  const conversationId: string =
-    body.conversationId || context.conversation_id || "";
+  const conversationId: string = body.conversationId || context.conversation_id || '';
+  const sandbox = context.sandbox ?? null;
   const store = context.store ?? null;
+  const cwd = process.cwd();
 
   logger.log(
-    `[request] cid=${conversationId}, message="${message.slice(
-      0,
-      80
-    )}...", files=${uploadedFiles.length}`
+    `[request] cid=${conversationId}, message="${message.slice(0, 80)}...", files=${uploadedFiles.length}`
   );
-  logger.log(`[tools] available: ${!!context.tools?.get}`);
 
-  // Save user message to store
-  if (store && conversationId) {
-    try {
-      await store.appendMessage({
-        conversationId,
-        role: "user",
-        content: message,
-      });
-    } catch (e) {
-      logger.error("[store] failed to save user message:", e);
-    }
-  }
-
-  // Load conversation history from store
-  let historyMessages: Anthropic.MessageParam[] = [];
-  if (store && conversationId) {
-    try {
-      const history = await store.getMessages({ conversationId });
-      if (Array.isArray(history) && history.length > 0) {
-        // Convert stored messages to Anthropic format (exclude the current message we just added)
-        // Only keep last 6 messages to control token usage
-        const pastMessages = history.slice(0, -1).slice(-6);
-        for (const msg of pastMessages) {
-          if (msg.role === "user" || msg.role === "assistant") {
-            // Truncate long messages to save tokens
-            const content = (msg.content || "").slice(0, 2000);
-            historyMessages.push({ role: msg.role, content });
-          }
-        }
-        logger.log(
-          `[history] loaded ${historyMessages.length} previous messages`
-        );
-      }
-    } catch (e) {
-      logger.error("[history] failed to load conversation history:", e);
-    }
-  }
-
-  // Build tool executors from context.tools MCP bundle
-  const toolBundle = buildToolExecutors(context);
-
-  // Direct sandbox access (faster, bypasses MCP tool layer)
-  const sandbox = context.sandbox ?? null;
-
-  // Write uploaded files to sandbox before starting the Agent
+  // ─── Sandbox readiness check ────────────────────────────────────────────────
   let sandboxWorking = false;
 
-  // Always check sandbox readiness (even without new files — sandbox persists across messages)
-  if (toolBundle.ready || sandbox) {
+  if (sandbox) {
     try {
-      if (sandbox?.commands?.run) {
-        await sandbox.commands.run('ls /tmp', { timeout: 10 });
-        sandboxWorking = true;
-        logger.log('[sandbox] ready (direct API)');
-      } else {
-        await toolBundle.execute('commands', { cmd: 'ls /tmp' });
-        sandboxWorking = true;
-        logger.log('[sandbox] ready (via tools)');
-      }
-    } catch (e) {
-      // Retry with delay
+      await sandbox.commands.run('ls /tmp', { timeout: 10 });
+      sandboxWorking = true;
+      logger.log('[sandbox] ready');
+    } catch {
+      // Retry with delay (sandbox may be cold-starting)
       for (let attempt = 0; attempt < 2; attempt++) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 2000));
         try {
-          if (sandbox?.commands?.run) {
-            await sandbox.commands.run('ls /tmp', { timeout: 10 });
-          } else {
-            await toolBundle.execute('commands', { cmd: 'ls /tmp' });
-          }
+          await sandbox.commands.run('ls /tmp', { timeout: 10 });
           sandboxWorking = true;
           logger.log(`[sandbox] ready (after ${attempt + 1} retries)`);
           break;
@@ -120,107 +107,94 @@ export async function onRequest(context: any) {
         }
       }
     }
+  }
 
-    if (sandboxWorking) {
-      for (const file of uploadedFiles) {
+  // ─── Write uploaded files to sandbox ────────────────────────────────────────
+  if (sandboxWorking && uploadedFiles.length > 0) {
+    for (const file of uploadedFiles) {
+      try {
+        const sandboxPath = `/tmp/${file.name}`;
+        let uploadSuccess = false;
+
+        const runCmd = async (cmd: string): Promise<string> => {
+          const r = await sandbox.commands.run(cmd, { timeout: 30 });
+          return r.stdout || '';
+        };
+
+        // Strategy 1: write base64 as text → decode with shell
         try {
-          const sandboxPath = `/tmp/${file.name}`;
-          let uploadSuccess = false;
+          const b64TmpPath = '/tmp/__upload_b64.tmp';
+          await sandbox.files.write(b64TmpPath, file.base64);
+          await runCmd(`base64 -d ${b64TmpPath} > ${shellQuote(sandboxPath)} && rm -f ${b64TmpPath}`);
 
-          // Helper: run a shell command via the best available method
-          const runCmd = async (cmd: string): Promise<string> => {
-            if (sandbox?.commands?.run) {
-              const r = await sandbox.commands.run(cmd, { timeout: 30 });
-              return r.stdout || '';
-            }
-            const r = await toolBundle.execute('commands', { cmd });
-            try { return JSON.parse(r).stdout || ''; } catch { return r; }
-          };
-
-          // Helper: write text to sandbox file
-          const writeText = async (path: string, content: string): Promise<void> => {
-            if (sandbox?.files?.write) {
-              await sandbox.files.write(path, content);
-            } else {
-              await toolBundle.execute('files_write', { path, content });
-            }
-          };
-
-          // Strategy: write base64 as text file → decode with shell command
-          // sandbox.files.write() accepts strings, perfect for base64 text
-          try {
-            const b64TmpPath = '/tmp/__upload_b64.tmp';
-            await writeText(b64TmpPath, file.base64);
-            await runCmd(`base64 -d ${b64TmpPath} > ${shellQuote(sandboxPath)} && rm -f ${b64TmpPath}`);
-
-            // Verify
-            const sizeStr = await runCmd(`stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`);
-            const fileSize = parseInt(sizeStr.trim(), 10) || 0;
-            if (fileSize > 0) {
-              uploadSuccess = true;
-              logger.log(`[upload] success via files.write+decode: ${sandboxPath} (${fileSize} bytes)`);
-            }
-          } catch (e) {
-            logger.log(`[upload] files.write method failed: ${(e as Error).message}`);
-          }
-
-          // Fallback: use runCode (Python) if files.write approach failed
-          if (!uploadSuccess) {
-            try {
-              const runCode = sandbox?.runCode
-                ? (code: string) => sandbox.runCode(code, { language: 'python' })
-                : (code: string) => toolBundle.execute('code_interpreter', { language: 'python', code });
-
-              // For small files, do it in one shot
-              if (file.base64.length <= 150_000) {
-                await runCode(`import base64\nwith open("${sandboxPath}", "wb") as f:\n    f.write(base64.b64decode("${file.base64}"))\nprint("ok")`);
-              } else {
-                // Write base64 chunks to temp file, then decode
-                const chunkSize = 150_000;
-                const totalChunks = Math.ceil(file.base64.length / chunkSize);
-                await runCode(`open("/tmp/__b64tmp", "w").close()`);
-                for (let i = 0; i < totalChunks; i++) {
-                  const chunk = file.base64.slice(i * chunkSize, (i + 1) * chunkSize);
-                  await runCode(`open("/tmp/__b64tmp", "a").write("${chunk}")`);
-                }
-                await runCode(`import base64, os\nwith open("/tmp/__b64tmp") as f:\n    d = base64.b64decode(f.read())\nwith open("${sandboxPath}", "wb") as f:\n    f.write(d)\nos.remove("/tmp/__b64tmp")\nprint(len(d))`);
-              }
-
-              const sizeStr = await runCmd(`stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`);
-              const fileSize = parseInt(sizeStr.trim(), 10) || 0;
-              if (fileSize > 0) {
-                uploadSuccess = true;
-                logger.log(`[upload] success via runCode: ${sandboxPath} (${fileSize} bytes)`);
-              }
-            } catch (e) {
-              logger.log(`[upload] runCode method failed: ${(e as Error).message}`);
-            }
-          }
-
-          if (!uploadSuccess) {
-            logger.error(`[upload] ALL methods failed for ${file.name}`);
-            sandboxWorking = false;
-            break;
+          const sizeStr = await runCmd(`stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`);
+          if ((parseInt(sizeStr.trim(), 10) || 0) > 0) {
+            uploadSuccess = true;
+            logger.log(`[upload] success via files.write+decode: ${sandboxPath}`);
           }
         } catch (e) {
-          logger.error(`[upload] failed for ${file.name}:`, (e as Error).message);
+          logger.log(`[upload] files.write method failed: ${(e as Error).message}`);
+        }
+
+        // Strategy 2: Python base64 decode (fallback)
+        if (!uploadSuccess) {
+          try {
+            const runCode = (code: string) => sandbox.runCode(code, { language: 'python' });
+
+            if (file.base64.length <= 150_000) {
+              await runCode(
+                `import base64\nwith open("${sandboxPath}", "wb") as f:\n    f.write(base64.b64decode("${file.base64}"))\nprint("ok")`
+              );
+            } else {
+              const chunkSize = 150_000;
+              const totalChunks = Math.ceil(file.base64.length / chunkSize);
+              await runCode(`open("/tmp/__b64tmp", "w").close()`);
+              for (let i = 0; i < totalChunks; i++) {
+                const chunk = file.base64.slice(i * chunkSize, (i + 1) * chunkSize);
+                await runCode(`open("/tmp/__b64tmp", "a").write("${chunk}")`);
+              }
+              await runCode(
+                `import base64, os\nwith open("/tmp/__b64tmp") as f:\n    d = base64.b64decode(f.read())\nwith open("${sandboxPath}", "wb") as f:\n    f.write(d)\nos.remove("/tmp/__b64tmp")\nprint(len(d))`
+              );
+            }
+
+            const sizeStr = await runCmd(`stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`);
+            if ((parseInt(sizeStr.trim(), 10) || 0) > 0) {
+              uploadSuccess = true;
+              logger.log(`[upload] success via runCode: ${sandboxPath}`);
+            }
+          } catch (e) {
+            logger.log(`[upload] runCode method failed: ${(e as Error).message}`);
+          }
+        }
+
+        if (!uploadSuccess) {
+          logger.error(`[upload] ALL methods failed for ${file.name}`);
           sandboxWorking = false;
           break;
         }
+      } catch (e) {
+        logger.error(`[upload] failed for ${file.name}:`, (e as Error).message);
+        sandboxWorking = false;
+        break;
       }
     }
 
     // Tell the AI files are ready — no need to list /tmp
     if (sandboxWorking && uploadedFiles.length > 0) {
       const fileList = uploadedFiles.map(f => `/tmp/${f.name}`).join(', ');
-      message = message + `\n\n[系统提示：文件已就绪，路径为: ${fileList}。请直接分析和处理，不需要先 list 目录确认。]`;
+      const sysMsg = locale === 'zh'
+        ? `\n\n[系统提示：文件已就绪，路径为: ${fileList}。请直接分析和处理，不需要先 list 目录确认。]`
+        : `\n\n[System: Files are ready at: ${fileList}. Start analysis directly — do not list the directory first.]`;
+      message = message + sysMsg;
     }
   }
 
-  // Fallback: if sandbox not working, inline text file content into message
+  // ─── Fallback: inline text file content when sandbox unavailable ─────────────
   if (!sandboxWorking && uploadedFiles.length > 0) {
     logger.log('[fallback] sandbox unavailable, inlining text file content into message');
-    let inlineContent = '\n\n--- FILE CONTENTS (sandbox unavailable, analyze text files below) ---\n';
+    let inlineContent =
+      '\n\n--- FILE CONTENTS (sandbox unavailable, analyze text files below) ---\n';
     const skippedFiles: string[] = [];
 
     for (const file of uploadedFiles) {
@@ -230,7 +204,6 @@ export async function onRequest(context: any) {
           skippedFiles.push(file.name);
           continue;
         }
-
         const decoded = content.toString('utf8');
         inlineContent += `\n### File: ${file.name}\n\`\`\`\n${decoded}\n\`\`\`\n`;
       } catch {
@@ -241,330 +214,320 @@ export async function onRequest(context: any) {
     if (skippedFiles.length > 0) {
       inlineContent += `\nSkipped binary or non-text files because sandbox is unavailable: ${skippedFiles.join(', ')}\n`;
     }
-
     message = message + inlineContent;
   }
 
-  // Build Anthropic client
-  const baseURL = process.env.AI_GATEWAY_BASE_URL || "";
+  // ─── Custom MCP tools (suggest_actions + deliver_file) ───────────────────────
+  // SSE side-channel: tool handlers push events; the message loop drains & yields
+  const sseQueue: string[] = [];
+  let suggestActionsCalled = false;
+  let deliverFileCalled = false;
 
-  const client = new Anthropic({
-    apiKey: process.env.AI_GATEWAY_API_KEY!,
-    baseURL,
-    timeout: 300_000,
+  const customMcpServer = createSdkMcpServer({
+    name: 'custom-tools',
+    alwaysLoad: true,
+    tools: [
+      {
+        name: 'suggest_actions',
+        description:
+          'Present a list of recommended actions to the user as clickable options. ' +
+          'Use this when you have analysed files and want to suggest processing options.',
+        inputSchema: {
+          actions: z.array(
+            z.object({
+              id: z.string().describe('Unique action ID (e.g. action_1)'),
+              emoji: z.string().describe('Emoji icon for the action'),
+              title: z.string().describe('Short title (under 20 chars)'),
+              description: z.string().describe('Brief description of what this action does'),
+            })
+          ).describe('List of suggested actions'),
+        },
+        handler: async ({ actions }: { actions: any[] }) => {
+          suggestActionsCalled = true;
+          sseQueue.push(sseEvent({ type: 'suggest_actions', actions }));
+          return {
+            content: [
+              { type: 'text' as const, text: 'Suggestions have been displayed to the user. Wait for them to choose an action.' },
+            ],
+          };
+        },
+      },
+      {
+        name: 'deliver_file',
+        description:
+          'Deliver a processed file to the user for download. ' +
+          'Call this after generating an output file (e.g. merged PDF, converted image). ' +
+          'The file will be sent as a downloadable link.',
+        inputSchema: {
+          path: z.string().describe('Absolute path to the output file in sandbox (e.g. /tmp/report.pdf)'),
+          filename: z.string().describe('Display filename for the user (e.g. report.pdf)'),
+          description: z.string().optional().describe('Brief description of the file content'),
+        },
+        handler: async ({
+          path,
+          filename,
+          description,
+        }: {
+          path: string;
+          filename: string;
+          description?: string;
+        }) => {
+          deliverFileCalled = true;
+          let base64 = '';
+          try {
+            if (sandbox?.commands?.run) {
+              const r = await sandbox.commands.run(`base64 -w 0 ${shellQuote(path)}`);
+              base64 = (r.stdout || '').trim();
+            }
+          } catch (e) {
+            logger.error('[deliver_file] failed to read file:', (e as Error).message);
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Error reading file "${path}": ${(e as Error).message}`,
+                },
+              ],
+            };
+          }
+
+          if (!base64 && sandbox?.commands?.run) {
+            // Fallback: scan /tmp for the most recently created file matching the extension
+            try {
+              const ext = filename.split('.').pop() || 'pdf';
+              const scanResult = await sandbox.commands.run(`ls -t /tmp/*.${ext} 2>/dev/null | head -1`);
+              const altPath = scanResult.stdout?.trim();
+              if (altPath && altPath !== path) {
+                logger.log(`[deliver_file] fallback: trying ${altPath}`);
+                const r2 = await sandbox.commands.run(`base64 -w 0 ${shellQuote(altPath)}`);
+                base64 = (r2.stdout || '').trim();
+              }
+            } catch {
+              // Ignore fallback scan errors
+            }
+          }
+
+          if (!base64) {
+            return {
+              content: [
+                { type: 'text' as const, text: `File not found or empty: ${path}` },
+              ],
+            };
+          }
+
+          sseQueue.push(
+            sseEvent({ type: 'file_output', base64, filename, description: description ?? '' })
+          );
+          return {
+            content: [
+              { type: 'text' as const, text: `File "${filename}" has been delivered to the user for download.` },
+            ],
+          };
+        },
+      },
+    ],
   });
 
-  const model = resolveModelName();
-
-  async function* generate(sig?: AbortSignal): AsyncGenerator<string> {
-    // Build messages with conversation history
-    const messages: Anthropic.MessageParam[] = [
-      ...historyMessages,
-      { role: "user", content: message },
-    ];
-
-    let fullAssistantText = "";
-    let totalInput = 0;
-    let totalOutput = 0;
-    let turnCount = 0;
-    const maxTurns = 15;
-    let suggestActionsCalled = false;
-    let deliverFileCalled = false;
-
-    while (turnCount < maxTurns) {
-      turnCount++;
-      if (sig?.aborted) break;
-
-      let response: Anthropic.Message;
-      // When sandbox is unavailable, only expose suggest_actions tool
-      const activeTools = sandboxWorking ? TOOLS : TOOLS.filter(t => t.name === 'suggest_actions');
-      // Build dynamic prompt based on file types (skills architecture)
-      const systemPrompt = buildSystemPrompt(uploadedFiles, sandboxWorking);
-      try {
-        response = await client.messages.create({
-          model,
-          max_tokens: 16384,
-          system: systemPrompt,
-          tools: activeTools,
-          messages,
-        });
-      } catch (apiError: any) {
-        logger.error(
-          "[api] messages.create failed:",
-          apiError.message,
-          apiError.status,
-          apiError.error
-        );
-        yield sseEvent({
-          type: "text_delta",
-          delta: `\n\n❌ API 调用失败: ${apiError.message}`,
-        });
-        deliverFileCalled = true; // suppress fallback suggestions on error
-        break;
-      }
-
-      totalInput += response.usage?.input_tokens || 0;
-      totalOutput += response.usage?.output_tokens || 0;
-
-      // Process response content blocks
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-      let hasToolUse = false;
-
-      for (const block of response.content) {
-        if (block.type === "text") {
-          const text = block.text || "";
-          if (text) {
-            // Filter out raw JSON tool_use that some models incorrectly embed in text
-            // This handles deeply nested JSON (e.g., code_interpreter with multi-line code)
-            let cleaned = text;
-            // Remove JSON objects that look like tool_use calls (greedy match for nested braces)
-            cleaned = cleaned.replace(/\{"type"\s*:\s*"tool_use"[\s\S]*?"input"\s*:\s*\{[\s\S]*?\}\s*\}/g, "");
-            // Also remove standalone JSON tool call blocks that start with {"id": "toolu_...
-            cleaned = cleaned.replace(/\{"id"\s*:\s*"toolu_[^"]*"[\s\S]*?"input"\s*:\s*\{[\s\S]*?\}\s*\}/g, "");
-            // Remove any remaining large JSON blobs (likely tool artifacts) — >200 chars of JSON
-            cleaned = cleaned.replace(/\{[^{}]{200,}\}/g, (match) => {
-              // Only remove if it looks like a tool call (has "name"/"input"/"code"/"language" keys)
-              if (match.includes('"name"') && (match.includes('"input"') || match.includes('"code"'))) return "";
-              return match;
-            });
-            cleaned = cleaned.trim();
-            if (cleaned) {
-              fullAssistantText += cleaned;
-              yield sseEvent({ type: "text_delta", delta: cleaned });
-            }
-          }
-        } else if (block.type === "tool_use") {
-          hasToolUse = true;
-          const toolName = block.name;
-          const toolInput = block.input as Record<string, any>;
-
-          logger.log(
-            `[tool] calling: ${toolName}`,
-            JSON.stringify(toolInput).slice(0, 200)
-          );
-          yield sseEvent({
-            type: "tool_called",
-            tool: toolName,
-            input: toolInput,
-          });
-
-          // Execute the sandbox tool
-          let resultText: string;
-          try {
-            if (toolName === 'suggest_actions') {
-              // Custom tool: emit structured suggestion card to frontend
-              suggestActionsCalled = true;
-              // Handle raw_arguments (some models/gateways wrap tool input as raw JSON string)
-              let actions = toolInput.actions || [];
-              if (!actions.length && toolInput.raw_arguments) {
-                try {
-                  const parsed = JSON.parse(toolInput.raw_arguments);
-                  actions = parsed.actions || [];
-                } catch {}
-              }
-              yield sseEvent({
-                type: "suggest_actions",
-                actions,
-              });
-              resultText = 'Suggestions have been displayed to the user. Wait for them to choose an action.';
-            } else if (toolName === 'deliver_file') {
-              deliverFileCalled = true;
-              // Custom tool: read file as base64 via commands tool and deliver to user
-              const b64Result = await toolBundle.execute('commands', { cmd: `base64 -w 0 ${toolInput.path}` });
-              let base64Content = '';
-              try {
-                const parsed = JSON.parse(b64Result);
-                base64Content = (parsed.stdout || '').trim();
-              } catch {
-                base64Content = b64Result.trim();
-              }
-              if (!base64Content) throw new Error(`Failed to read file: ${toolInput.path}`);
-              resultText = JSON.stringify({
-                __file_output__: true,
-                base64: base64Content,
-                filename: toolInput.filename || toolInput.path.split('/').pop(),
-                description: toolInput.description || '',
-              });
-            } else if (toolName === 'files') {
-              // Map composite 'files' tool to split tools: files_read, files_write, files_list, etc.
-              const op = toolInput.op;
-              const mappedName = `files_${op === 'makeDir' ? 'make_dir' : op}`;
-              const mappedArgs: Record<string, any> = { path: toolInput.path };
-              if (op === 'write' && toolInput.content) mappedArgs.content = toolInput.content;
-              resultText = await toolBundle.execute(mappedName, mappedArgs);
-            } else {
-              resultText = await toolBundle.execute(toolName, toolInput);
-            }
-
-            logger.log(`[tool] ${toolName} success, result length: ${resultText.length}`);
-
-            // Check if this is a file delivery result (BEFORE truncation — base64 is large)
-            if (resultText.includes("__file_output__")) {
-              try {
-                const fileData = JSON.parse(resultText);
-                if (fileData.__file_output__) {
-                  yield sseEvent({
-                    type: "file_output",
-                    filename: fileData.filename,
-                    base64: fileData.base64,
-                    description: fileData.description,
-                  });
-                  resultText = `File "${fileData.filename}" has been delivered to the user for download.`;
-                }
-              } catch {
-                /* not valid JSON, treat as normal result */
-              }
-            }
-
-            // Truncate excessively long tool results to prevent request body overflow
-            // (applied AFTER file_output extraction so base64 data isn't lost)
-            if (resultText.length > 8000) {
-              resultText = resultText.slice(0, 8000) + '\n...[truncated, result too long]';
-            }
-
-            // For code_interpreter, emit only clean stdout for the user to see
-            // Errors and raw JSON are kept internal (model sees them in tool_result)
-            if (toolName === "code_interpreter") {
-              try {
-                const parsed = typeof resultText === 'string' ? JSON.parse(resultText) : resultText;
-                const stdoutArr = parsed.logs?.stdout || [];
-                const stdout = Array.isArray(stdoutArr) ? stdoutArr.join('') : (parsed.stdout || '');
-                // Only emit stdout (user-visible output), skip stderr/errors/raw JSON
-                if (stdout.trim()) {
-                  yield sseEvent({
-                    type: "code_output",
-                    tool: toolName,
-                    stdout: stdout,
-                  });
-                }
-                // Do NOT emit stderr or error tracebacks to the user
-              } catch {
-                // If resultText is plain text (not JSON), show it directly
-                // but filter out anything that looks like a raw JSON blob
-                if (resultText.trim() && !resultText.trim().startsWith('{')) {
-                  yield sseEvent({ type: "code_output", tool: toolName, stdout: resultText });
-                }
-              }
-            }
-          } catch (error) {
-            resultText = `Error: ${
-              error instanceof Error ? error.message : String(error)
-            }`;
-            logger.error(`[tool] ${toolName} error:`, resultText);
-          }
-
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: resultText,
-          });
-        }
-      }
-
-      // If no tool use, we're done. Only break when there is genuinely no tool_use block.
-      // When hasToolUse is true we MUST continue the loop regardless of stop_reason,
-      // because the model may emit text + tool_use in one response with stop_reason=end_turn.
-      if (!hasToolUse) {
-        logger.log(
-          `[loop] ending: no tool_use, stop_reason=${response.stop_reason}, turn=${turnCount}`
-        );
-        break;
-      }
-
-      // If max_tokens was hit, stop — don't continue or the model will repeat content
-      if (response.stop_reason === 'max_tokens') {
-        logger.log(`[loop] ending: max_tokens hit, turn=${turnCount}`);
-        break;
-      }
-
-      // Continue the conversation with tool results
-      messages.push({ role: "assistant", content: response.content });
-      messages.push({ role: "user", content: toolResults });
+  // ─── EdgeOne sandbox MCP server ──────────────────────────────────────────────
+  let sandboxMcpServer: any = null;
+  let edgeoneMcp: any = null;
+  if (sandboxWorking && typeof context.tools?.toClaudeMcpServer === 'function') {
+    try {
+      edgeoneMcp = context.tools.toClaudeMcpServer();
+      sandboxMcpServer = createSdkMcpServer({
+        name: edgeoneMcp.name,
+        tools: edgeoneMcp.tools,
+        alwaysLoad: true,
+      });
+      logger.log('[mcp] EdgeOne sandbox MCP server created');
+    } catch (e) {
+      logger.error('[mcp] failed to create sandbox MCP server:', (e as Error).message);
     }
+  }
 
-    // If loop ended without producing any text (e.g., maxTurns hit), emit a fallback message
-    if (!fullAssistantText.trim() && turnCount >= maxTurns) {
-      const fallbackMsg = '\n\n⚠️ 处理超时，请尝试简化操作或重新上传文件。';
-      yield sseEvent({ type: "text_delta", delta: fallbackMsg });
-      fullAssistantText += fallbackMsg;
+  // Build mcpServers as an object (required by claude-agent-sdk)
+  const mcpServers: Record<string, any> = {
+    'custom-tools': customMcpServer,
+  };
+  if (sandboxMcpServer && edgeoneMcp) {
+    mcpServers[edgeoneMcp.name] = sandboxMcpServer;
+  }
+
+  // ─── Abort controller ────────────────────────────────────────────────────────
+  const abortController = new AbortController();
+  if (signal) {
+    signal.addEventListener('abort', () => abortController.abort(), { once: true });
+  }
+
+  // ─── Session store ────────────────────────────────────────────────────────────
+  const claudeSessionStore = store?.claude_session_store?.() ?? null;
+
+  // ─── Session binding (resume vs new) ─────────────────────────────────────────
+  const sessionBinding = await resolveClaudeSessionBinding(claudeSessionStore, conversationId, cwd);
+
+  // ─── System prompt (skills-based, dynamic) ───────────────────────────────────
+  const systemPrompt = buildSystemPrompt(uploadedFiles, sandboxWorking, locale);
+
+  // ─── Build query options ──────────────────────────────────────────────────────
+  const queryOptions: Record<string, any> = {
+    model: resolveModelName(ctxEnv),
+    systemPrompt,
+    cwd,
+    tools: [],
+    allowedTools: [...(edgeoneMcp?.allowedTools ?? [])],
+    settingSources: ['project'],
+    skills: 'all',
+    permissionMode: 'bypassPermissions',
+    maxTurns: 10,
+    env: {
+      ...ctxEnv,
+      ...collectGatewayEnv(ctxEnv),
+    },
+    mcpServers,
+    abortController,
+    ...sessionBinding,
+  };
+
+  logger.log(`[query] model=${queryOptions.model}, session=${JSON.stringify(sessionBinding)}`);
+
+  // ─── Helper: extract stdout + stderr from code_interpreter result ───────────
+  function extractCodeInterpreterOutput(raw: string): { stdout: string; stderr: string } {
+    if (!raw) return { stdout: '', stderr: '' };
+    try {
+      const parsed = JSON.parse(raw);
+      const stdout = (Array.isArray(parsed.logs?.stdout) ? parsed.logs.stdout.join('') : '') || parsed.stdout || '';
+      const errorStr = typeof parsed.error === 'string'
+        ? parsed.error
+        : parsed.error?.message
+          ? `${parsed.error.name ?? 'Error'}: ${parsed.error.message}`
+          : '';
+      const stderr = (Array.isArray(parsed.logs?.stderr) ? parsed.logs.stderr.join('') : '') || parsed.stderr || errorStr || '';
+      return { stdout, stderr };
+    } catch {
+      // Not JSON — return as-is if it looks like plain text output
+      const text = raw.trim().startsWith('{') ? '' : raw;
+      return { stdout: text, stderr: '' };
     }
+  }
 
-    // FALLBACK: If AI didn't call suggest_actions and didn't deliver a file, auto-generate suggestions
-    if (!suggestActionsCalled && !deliverFileCalled && uploadedFiles.length > 0) {
-      logger.log('[fallback] AI did not call suggest_actions, generating default suggestions');
-      const fileTypes = new Set(uploadedFiles.map(f => {
-        const ext = f.name.split('.').pop()?.toLowerCase() || '';
-        if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return 'image';
-        if (['pdf'].includes(ext)) return 'pdf';
-        if (['doc', 'docx'].includes(ext)) return 'word';
-        if (['xls', 'xlsx'].includes(ext)) return 'excel';
-        if (['csv'].includes(ext)) return 'csv';
-        return 'text';
-      }));
+  // ─── SSE generator ────────────────────────────────────────────────────────────
+  async function* generate(): AsyncGenerator<string> {
+    let fullAssistantText = '';
+    let lastMsgType = '';
 
-      const defaultActions: Array<{ id: string; emoji: string; title: string; description: string }> = [];
-      if (fileTypes.has('image')) {
-        defaultActions.push(
-          { id: 'a1', emoji: '🔄', title: '格式转换', description: '将图片转换为 PNG、WebP 等其他格式' },
-          { id: 'a2', emoji: '📦', title: '压缩图片', description: '压缩图片文件大小，优化存储' },
-          { id: 'a3', emoji: '📐', title: '调整尺寸', description: '调整图片尺寸或裁剪' },
-          { id: 'a4', emoji: '💧', title: '添加水印', description: '在图片上添加自定义文字水印' },
-        );
-      } else if (fileTypes.has('pdf')) {
-        defaultActions.push(
-          { id: 'a1', emoji: '📝', title: '提取文字', description: '从 PDF 中提取全部文本内容' },
-          { id: 'a2', emoji: '📊', title: '提取表格', description: '提取 PDF 中的表格数据' },
-          { id: 'a3', emoji: '📋', title: '生成摘要', description: '总结 PDF 文档的核心内容' },
-          { id: 'a4', emoji: '🔗', title: '合并 PDF', description: '与其他 PDF 文件合并' },
-        );
-      } else if (fileTypes.has('word')) {
-        defaultActions.push(
-          { id: 'a1', emoji: '📄', title: '转换为 PDF', description: '将 Word 文档转换为 PDF 格式' },
-          { id: 'a2', emoji: '📝', title: '提取文字', description: '提取文档中的全部文本' },
-          { id: 'a3', emoji: '📊', title: '提取表格', description: '提取文档中的表格数据' },
-          { id: 'a4', emoji: '📋', title: '内容摘要', description: '生成文档核心内容摘要' },
-        );
-      } else if (fileTypes.has('csv') || fileTypes.has('excel')) {
-        defaultActions.push(
-          { id: 'a1', emoji: '📊', title: '数据分析', description: '统计分析并生成摘要' },
-          { id: 'a2', emoji: '📈', title: '生成图表', description: '将数据可视化为图表' },
-          { id: 'a3', emoji: '📄', title: '导出 PDF 报告', description: '生成格式化的 PDF 数据报告' },
-        );
-      } else {
-        // text/md/json/etc.
-        defaultActions.push(
-          { id: 'a1', emoji: '📋', title: '内容摘要', description: '提取核心内容生成摘要' },
-          { id: 'a2', emoji: '📄', title: '转换为 PDF', description: '将文本内容排版为 PDF 文件' },
-          { id: 'a3', emoji: '🔍', title: '结构分析', description: '分析文件结构和关键信息' },
-          { id: 'a4', emoji: '🌐', title: '翻译', description: '将内容翻译为其他语言' },
-        );
-      }
+    // Per-block sent-length tracker to deduplicate incremental text updates
+    const sentTextLenByBlock = new Map<number, number>();
 
-      yield sseEvent({ type: "suggest_actions", actions: defaultActions });
-    }
+    // Map tool_use block ids → short tool names (for code_output parsing)
+    const toolUseIdToName = new Map<string, string>();
 
-    // Emit usage
-    yield sseEvent({
-      type: "usage",
-      input_tokens: totalInput,
-      output_tokens: totalOutput,
-      total_tokens: totalInput + totalOutput,
+    const q = query({
+      prompt: message,
+      options: queryOptions,
     });
 
-    // Save assistant response to store
-    if (store && conversationId && fullAssistantText.trim()) {
-      try {
-        await store.appendMessage({
-          conversationId,
-          role: "assistant",
-          content: fullAssistantText,
+    try {
+      for await (const msg of (q as any)) {
+        if (signal?.aborted) break;
+
+        // Drain SSE queue after every message
+        for (const evt of sseQueue.splice(0)) yield evt;
+
+        // Reset text deduplication when a new assistant turn begins
+        if (msg.type === 'assistant' && lastMsgType === 'user') {
+          sentTextLenByBlock.clear();
+        }
+        lastMsgType = msg.type;
+
+        // ── Assistant message: emit text deltas + tool_called events ──────────
+        if (msg.type === 'assistant') {
+          const blocks: any[] = msg.message?.content ?? [];
+          for (let idx = 0; idx < blocks.length; idx++) {
+            const block = blocks[idx];
+
+            if (block.type === 'text') {
+              const fullText: string = block.text || '';
+              const alreadySent = sentTextLenByBlock.get(idx) ?? 0;
+              if (fullText.length > alreadySent) {
+                const delta = fullText.slice(alreadySent);
+                sentTextLenByBlock.set(idx, fullText.length);
+                fullAssistantText += delta;
+                yield sseEvent({ type: 'text_delta', delta });
+              }
+            } else if (block.type === 'tool_use') {
+              const rawName: string = block.name || '';
+              // MCP tool names are "mcp__servername__toolname" — extract short name
+              const toolName = rawName.split('__').pop() || rawName;
+              toolUseIdToName.set(block.id, toolName);
+              const inputSummary = JSON.stringify(block.input ?? {}).slice(0, 200);
+              logger.log(`[tool_use] ${toolName} | input=${inputSummary}`);
+              yield sseEvent({ type: 'tool_called', tool: toolName, input: block.input ?? {} });
+            }
+          }
+
+        // ── User message (tool results): emit code_output for code_interpreter ─
+        } else if (msg.type === 'user') {
+          // Drain queue again — custom MCP handlers may have just pushed events
+          for (const evt of sseQueue.splice(0)) yield evt;
+
+          const blocks: any[] = msg.message?.content ?? [];
+          for (const block of blocks) {
+            if (block.type === 'tool_result') {
+              const toolName = toolUseIdToName.get(block.tool_use_id) || '';
+
+              // Normalize content: may be string, array of blocks, or undefined
+              const contentBlocks: Array<{ type: string; text?: string }> =
+                Array.isArray(block.content)
+                  ? block.content
+                  : typeof block.content === 'string'
+                  ? [{ type: 'text', text: block.content }]
+                  : [];
+
+              const fullText = contentBlocks
+                .filter(b => b.type === 'text')
+                .map(b => b.text || '')
+                .join('');
+
+              // Log all tool results for diagnostics (truncated)
+              logger.log(`[tool_result] ${toolName} | len=${fullText.length} | preview=${fullText.slice(0, 300).replace(/\n/g, '↵')}`);
+
+              if (toolName === 'code_interpreter') {
+                const { stdout, stderr } = extractCodeInterpreterOutput(fullText);
+                if (stdout.trim()) {
+                  yield sseEvent({ type: 'code_output', stdout });
+                }
+                if (stderr.trim()) {
+                  yield sseEvent({ type: 'code_error', stderr });
+                }
+              }
+            }
+          }
+
+        // ── Result: query complete ─────────────────────────────────────────────
+        } else if (msg.type === 'result') {
+          // Drain final queue
+          for (const evt of sseQueue.splice(0)) yield evt;
+          break;
+        }
+      }
+    } catch (err: any) {
+      logger.error('[query] error:', err);
+      if (!signal?.aborted) {
+        yield sseEvent({
+          type: 'text_delta',
+          delta: `\n\n❌ 处理失败: ${err.message || String(err)}`,
         });
-      } catch (e) {
-        logger.error("[store] failed to save assistant response:", e);
       }
     }
 
-    yield "data: [DONE]\n\n";
+    // ─── Fallback suggest_actions ────────────────────────────────────────────
+    // If AI never called suggest_actions and never delivered a file, auto-emit defaults
+    if (!suggestActionsCalled && !deliverFileCalled && uploadedFiles.length > 0) {
+      logger.log('[fallback] AI did not call suggest_actions, generating defaults');
+      yield sseEvent({ type: 'suggest_actions', actions: buildDefaultActions(uploadedFiles) });
+    }
+
+    yield 'data: [DONE]\n\n';
   }
 
   return createSSEResponse(generate, signal);

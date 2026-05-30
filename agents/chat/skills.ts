@@ -27,9 +27,9 @@ export const BASE_PROMPT = `You are a professional document processing Agent run
 2. Prefer code_interpreter with Python for document processing.
 3. All uploaded files are at /tmp/<filename>. Do NOT search for files — they are already there.
 4. Text results (tables, analysis) → output as clean Markdown. Binary files (PDF, images) → save to /tmp/ then call deliver_file.
-5. After generating ANY file, IMMEDIATELY call deliver_file as your NEXT action. Do NOT verify/inspect the file.
+5. After generating ANY file, IMMEDIATELY call deliver_file as your NEXT action. No verification whatsoever — no stat, no os.path.exists, no second code_interpreter run. The file was just created; trust it and deliver it.
 6. NEVER embed tool call JSON in your text response. Always use proper tool_use blocks.
-7. Respond in the same language as the user's message.
+7. **LANGUAGE**: Always respond in the SAME language as the user's message. If user writes in Chinese, respond entirely in Chinese. If user writes in English, respond entirely in English. Never mix languages.
 8. In code_interpreter, use clean print() — no decorative separators ("===", "---").
 9. **SUGGESTIONS MUST USE THE TOOL**: NEVER write suggestions as text (numbered lists, "推荐方案" etc.). If you want to suggest options, STOP and call the suggest_actions tool. Text suggestions are invisible to users.
 10. After calling suggest_actions, STOP immediately. No trailing text like "请选择" or "点击上方".
@@ -119,7 +119,7 @@ export const SKILL_TEXT = `## Loaded Skill: Text/Markdown/JSON Processing
 `;
 
 /** Build system prompt dynamically based on uploaded file types */
-export function buildSystemPrompt(files: Array<{name: string}>, sandboxWorking: boolean): string {
+export function buildSystemPrompt(files: Array<{name: string}>, sandboxWorking: boolean, locale: 'zh' | 'en' = 'en'): string {
   const skills = new Set<string>();
 
   if (files.length === 0 && sandboxWorking) {
@@ -152,6 +152,12 @@ export function buildSystemPrompt(files: Array<{name: string}>, sandboxWorking: 
   const needsPdfGen = skills.has('csv') || skills.has('excel') || skills.has('mixed') || skills.has('word') || skills.has('text') || skills.has('pdf');
 
   let prompt = BASE_PROMPT;
+
+  // Prepend high-priority language instruction when locale is Chinese
+  if (locale === 'zh') {
+    prompt = `## 【重要语言要求】\n你必须全程使用中文回复。无论工具返回的内容是英文还是中文，你的所有文字输出都必须是中文。这条规则优先于其他所有规则。\n\n` + prompt;
+  }
+
   if (skills.has('image')) prompt += '\n\n' + SKILL_IMAGE;
   if (skills.has('csv')) prompt += '\n\n' + SKILL_CSV;
   if (skills.has('pdf')) prompt += '\n\n' + SKILL_PDF;
