@@ -18,10 +18,15 @@ export interface FileItem {
   base64?: string;
 }
 
+interface ThinkingStep {
+  type: 'tool_call' | 'error';
+  content: string;
+}
+
 interface ActivityEntry {
   id: string;
   timestamp: number;
-  type: 'user' | 'text' | 'tool_call' | 'tool_output' | 'file_download' | 'error' | 'system' | 'suggestions';
+  type: 'user' | 'text' | 'tool_call' | 'tool_output' | 'file_download' | 'error' | 'system' | 'suggestions' | 'thinking_group' | 'retry_card';
   content: string;
   meta?: Record<string, any>;
 }
@@ -38,6 +43,90 @@ function StreamingText({ content, isStreaming }: { content: string; isStreaming:
     return <pre className="prose-chat whitespace-pre-wrap text-sm font-sans">{content}</pre>;
   }
   return <MarkdownBlock content={content} />;
+}
+
+// ============ Thinking Panel ============
+
+function ThinkingPanel({
+  steps,
+  collapsed,
+  isLive,
+  onToggle,
+  isDark,
+  locale,
+}: {
+  steps: ThinkingStep[];
+  collapsed: boolean;
+  isLive: boolean;
+  onToggle: () => void;
+  isDark: boolean;
+  locale: string;
+}) {
+  const isZh = locale === 'zh';
+  const stepCount = steps.length;
+
+  return (
+    <div className={`rounded-xl border overflow-hidden text-xs ${isDark ? 'bg-gray-900/50 border-gray-700/50' : 'bg-gray-50/90 border-gray-200'}`}>
+      {/* Header */}
+      <button
+        onClick={onToggle}
+        className={`w-full flex items-center gap-2 px-3 py-2.5 text-left transition-colors ${isDark ? 'hover:bg-gray-800/40' : 'hover:bg-gray-100/80'}`}
+      >
+        {isLive ? (
+          <span className="w-3 h-3 rounded-full border-2 border-blue-400 border-t-transparent animate-spin flex-shrink-0" />
+        ) : (
+          <svg
+            className={`w-3 h-3 flex-shrink-0 transition-transform duration-200 ${collapsed ? '' : 'rotate-90'} ${isDark ? 'text-gray-500' : 'text-gray-400'}`}
+            fill="none" viewBox="0 0 24 24" stroke="currentColor"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+          </svg>
+        )}
+        <span className={`font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+          {isLive
+            ? (isZh ? '处理中...' : 'Processing...')
+            : stepCount > 0
+              ? (isZh ? `思考过程 · ${stepCount} 步操作` : `Thinking · ${stepCount} steps`)
+              : (isZh ? '思考过程' : 'Thinking')}
+        </span>
+        {!isLive && stepCount > 0 && (
+          <span className={`ml-auto ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+            {collapsed ? '▼' : '▲'}
+          </span>
+        )}
+      </button>
+
+      {/* Steps */}
+      {!collapsed && (
+        <div className={`border-t ${isDark ? 'border-gray-700/40' : 'border-gray-100'}`}>
+          <div className="px-3 py-2.5 space-y-1.5">
+            {steps.map((step, i) => (
+              <div key={i} className="flex items-start gap-2">
+                <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[10px] font-medium mt-0.5 ${
+                  step.type === 'error'
+                    ? (isDark ? 'bg-red-900/30 text-red-300' : 'bg-red-50 text-red-600')
+                    : (isDark ? 'bg-amber-900/20 text-amber-300' : 'bg-amber-50 text-amber-700')
+                }`}>
+                  {step.type === 'error' ? 'ERR' : (isZh ? '操作' : 'ACT')}
+                </span>
+                <span className={`leading-relaxed ${
+                  step.type === 'error'
+                    ? (isDark ? 'text-red-300/80' : 'text-red-600')
+                    : (isDark ? 'text-amber-200/70' : 'text-amber-700')
+                }`}>{step.content}</span>
+              </div>
+            ))}
+            {isLive && (
+              <div className={`flex items-center gap-1.5 pt-0.5 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                <span className="w-1 h-1 rounded-full bg-current animate-pulse" />
+                <span>{isZh ? '等待下一步操作...' : 'Waiting for next action...'}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ============ Helpers ============
@@ -265,10 +354,39 @@ export default function Home() {
     } else {
       addActivity('user', text);
     }
-    addActivity('system', t.startProcessing);
+
+    // Create a thinking group for this processing run
+    const thinkingGroupId = `thinking-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setActivities((prev) => [...prev, {
+      id: thinkingGroupId,
+      timestamp: Date.now(),
+      type: 'thinking_group' as const,
+      content: '',
+      meta: { steps: [] as ThinkingStep[], collapsed: false, isLive: true },
+    }]);
 
     // Deferred suggestions
     let pendingSuggestions: Array<{ id: string; emoji: string; title: string; description: string }> | null = null;
+    let hadErrors = false;
+    let gotFile = false;
+
+    // Helper: push a step into the thinking group
+    const pushThinkingStep = (step: ThinkingStep) => {
+      setActivities((prev) => prev.map((a) =>
+        a.id === thinkingGroupId
+          ? { ...a, meta: { ...a.meta, steps: [...(a.meta?.steps || []), step] } }
+          : a
+      ));
+    };
+
+    // Helper: close (collapse) the thinking group
+    const closeThinkingGroup = () => {
+      setActivities((prev) => prev.map((a) =>
+        a.id === thinkingGroupId
+          ? { ...a, meta: { ...a.meta, collapsed: true, isLive: false } }
+          : a
+      ));
+    };
 
     try {
       const resp = await fetch('/chat', {
@@ -330,13 +448,7 @@ export default function Home() {
               currentTextId = '';
               if (event.tool !== 'suggest_actions') {
                 const agentAction = toolToAgentAction(event.tool, event.input, locale);
-                setActivities((prev) => {
-                  const lastIdx = prev.length - 1;
-                  if (lastIdx >= 0 && prev[lastIdx].type === 'tool_call' && prev[lastIdx].content === agentAction) {
-                    return prev;
-                  }
-                  return [...prev, { id: `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, timestamp: Date.now(), type: 'tool_call' as const, content: agentAction, meta: { tool: event.tool } }];
-                });
+                pushThinkingStep({ type: 'tool_call', content: agentAction });
               }
             } else if (event.type === 'suggest_actions' && event.actions) {
               pendingSuggestions = event.actions;
@@ -344,15 +456,17 @@ export default function Home() {
               // Intentionally suppressed — AI text response already summarises results
             } else if (event.type === 'code_error') {
               if (event.stderr?.trim()) {
+                hadErrors = true;
                 // Show only the first meaningful error line, not full Python traceback
                 const lines = event.stderr.trim().split('\n');
                 const errorLine = lines.find((l: string) =>
                   /^(Error|Exception|ValueError|TypeError|ImportError|SyntaxError|AttributeError|NameError|KeyError|IndexError|OSError|IOError|RuntimeError|ModuleNotFoundError|FileNotFoundError|PermissionError|ZeroDivisionError)/
                     .test(l)
                 ) || lines[lines.length - 1] || lines[0];
-                addActivity('error', errorLine.slice(0, 300));
+                pushThinkingStep({ type: 'error', content: errorLine.slice(0, 300) });
               }
             } else if (event.type === 'file_output' && event.filename) {
+              gotFile = true;
               addActivity('file_download', event.filename, { base64: event.base64, description: event.description });
             } else if (event.type === 'usage') {
               setTokenUsage((prev) => ({ input: prev.input + (event.input_tokens || 0), output: prev.output + (event.output_tokens || 0) }));
@@ -361,9 +475,18 @@ export default function Home() {
         }
       }
 
-      // Render suggestions at the end
+      // Collapse the thinking group now that processing is done
+      closeThinkingGroup();
+
+      // Render suggestions, retry card, or task complete
       if (pendingSuggestions) {
         addActivity('suggestions', '', { actions: pendingSuggestions });
+      } else if (hadErrors && !gotFile) {
+        // Errors occurred but no file was produced — show retry card
+        addActivity('retry_card',
+          locale === 'zh' ? '处理过程中遇到了问题，请重试' : 'Something went wrong during processing, please retry',
+          { message: text }
+        );
       } else {
         setActivities((prev) => {
           const last = prev[prev.length - 1];
@@ -378,6 +501,7 @@ export default function Home() {
         addActivity('system', t.taskComplete);
       }
     } catch (err) {
+      closeThinkingGroup();
       addActivity('error', `${(err as Error).message}`);
     } finally {
       setIsProcessing(false);
@@ -510,84 +634,141 @@ export default function Home() {
           )}
 
           {/* Activity entries */}
-          {activities.map((entry) => (
-            <div key={entry.id} className="flex items-start gap-3 min-w-0 max-w-3xl mx-auto w-full">
-              <span className={`text-[10px] font-mono mt-1 w-14 flex-shrink-0 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>{timeStr(entry.timestamp)}</span>
+          {activities.map((entry) => {
 
-              {entry.type === 'user' && (
-                <>
-                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-blue-600/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>YOU</span>
-                  <p className={`text-sm ${isDark ? 'text-blue-200' : 'text-blue-700'}`}>{entry.content}</p>
-                </>
-              )}
-
-              {entry.type === 'system' && (
-                <p className={`text-xs italic ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{entry.content}</p>
-              )}
-
-              {entry.type === 'tool_call' && (
-                <>
-                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-amber-900/20 text-amber-300' : 'bg-amber-50 text-amber-700'}`}>
-                    {locale === 'zh' ? '操作' : 'ACT'}
-                  </span>
-                  <span className={`text-xs ${isDark ? 'text-amber-200/80' : 'text-amber-700'}`}>{entry.content}</span>
-                </>
-              )}
-
-              {entry.type === 'suggestions' && entry.meta?.actions && (
-                <div className="flex-1 min-w-0">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1">
-                    {(entry.meta.actions as Array<{ id: string; emoji: string; title: string; description: string }>).map((action) => (
-                      <button
-                        key={action.id}
-                        onClick={() => sendMessage(action.title)}
-                        disabled={isProcessing}
-                        className={`text-left px-3.5 py-3 rounded-xl border transition-all disabled:opacity-50 ${isDark
-                          ? 'bg-gray-800/40 hover:bg-gray-700/60 border-gray-700/60 hover:border-blue-500/50'
-                          : 'bg-white hover:bg-blue-50 border-gray-200 hover:border-blue-300 shadow-sm'
-                        }`}
-                      >
-                        <div className="flex items-start gap-2.5">
-                          <span className="text-base flex-shrink-0 mt-0.5">{action.emoji}</span>
-                          <div className="min-w-0">
-                            <p className={`text-xs font-medium ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{action.title}</p>
-                            <p className={`text-[11px] mt-0.5 leading-relaxed ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{action.description}</p>
-                          </div>
-                        </div>
-                      </button>
-                    ))}
+            // ── Thinking group (collapsible) ──
+            if (entry.type === 'thinking_group') {
+              const steps: ThinkingStep[] = entry.meta?.steps || [];
+              // Hide if no steps and already closed (pure text response, no tool calls)
+              if (steps.length === 0 && !entry.meta?.isLive) return null;
+              return (
+                <div key={entry.id} className="flex items-start gap-3 min-w-0 max-w-3xl mx-auto w-full">
+                  <span className={`text-[10px] font-mono mt-3 w-14 flex-shrink-0 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>{timeStr(entry.timestamp)}</span>
+                  <div className="flex-1 min-w-0">
+                    <ThinkingPanel
+                      steps={steps}
+                      collapsed={entry.meta?.collapsed ?? false}
+                      isLive={entry.meta?.isLive ?? false}
+                      onToggle={() => {
+                        setActivities((prev) => prev.map((a) =>
+                          a.id === entry.id
+                            ? { ...a, meta: { ...a.meta, collapsed: !a.meta?.collapsed } }
+                            : a
+                        ));
+                      }}
+                      isDark={isDark}
+                      locale={locale}
+                    />
                   </div>
                 </div>
-              )}
+              );
+            }
 
-              {entry.type === 'text' && (
-                <>
-                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-gray-700/60 text-gray-300' : 'bg-gray-200 text-gray-600'}`}>AI</span>
-                  <div className="flex-1 min-w-0 overflow-x-auto">
-                    <StreamingText content={entry.content} isStreaming={isProcessing && entry.id === activities[activities.length - 1]?.id} />
+            // ── Retry card ──
+            if (entry.type === 'retry_card') {
+              return (
+                <div key={entry.id} className="flex items-start gap-3 min-w-0 max-w-3xl mx-auto w-full">
+                  <span className={`text-[10px] font-mono mt-1 w-14 flex-shrink-0 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>{timeStr(entry.timestamp)}</span>
+                  <div className={`flex-1 rounded-xl border p-3.5 ${isDark ? 'bg-red-950/10 border-red-800/30' : 'bg-red-50 border-red-200'}`}>
+                    <p className={`text-xs mb-3 ${isDark ? 'text-red-300' : 'text-red-600'}`}>
+                      ⚠️ {entry.content}
+                    </p>
+                    <button
+                      onClick={() => sendMessage(entry.meta?.message)}
+                      disabled={isProcessing}
+                      className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 ${isDark
+                        ? 'bg-red-900/30 hover:bg-red-900/50 text-red-300 border border-red-800/40'
+                        : 'bg-white hover:bg-red-50 text-red-600 border border-red-200 shadow-sm'
+                      }`}
+                    >
+                      🔄 {locale === 'zh' ? '重新操作' : 'Retry'}
+                    </button>
                   </div>
-                </>
-              )}
+                </div>
+              );
+            }
 
-              {entry.type === 'file_download' && (
-                <>
-                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-emerald-900/20 text-emerald-300' : 'bg-emerald-50 text-emerald-700'}`}>FILE</span>
-                  <span className={`text-xs ${isDark ? 'text-emerald-400' : 'text-emerald-600'}`}>
-                    {locale === 'zh' ? '文件已生成 ↓' : 'File ready ↓'}
-                  </span>
-                </>
-              )}
+            // ── Standard entries ──
+            return (
+              <div key={entry.id} className="flex items-start gap-3 min-w-0 max-w-3xl mx-auto w-full">
+                <span className={`text-[10px] font-mono mt-1 w-14 flex-shrink-0 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>{timeStr(entry.timestamp)}</span>
 
-              {entry.type === 'error' && (
-                <>
-                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-red-900/20 text-red-300' : 'bg-red-50 text-red-600'}`}>ERR</span>
-                  <pre className={`text-xs overflow-x-auto max-h-20 overflow-y-auto flex-1 p-1.5 rounded ${isDark ? 'text-red-300/80 bg-red-900/10' : 'text-red-600 bg-red-50'}`}>
-                    {entry.content.slice(0, 500)}
-                  </pre>
-                </>
-              )}
-            </div>
-          ))}
+                {entry.type === 'user' && (
+                  <>
+                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-blue-600/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>YOU</span>
+                    <p className={`text-sm ${isDark ? 'text-blue-200' : 'text-blue-700'}`}>{entry.content}</p>
+                  </>
+                )}
+
+                {entry.type === 'system' && (
+                  <p className={`text-xs italic ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{entry.content}</p>
+                )}
+
+                {/* tool_call kept for legacy/fallback rendering */}
+                {entry.type === 'tool_call' && (
+                  <>
+                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-amber-900/20 text-amber-300' : 'bg-amber-50 text-amber-700'}`}>
+                      {locale === 'zh' ? '操作' : 'ACT'}
+                    </span>
+                    <span className={`text-xs ${isDark ? 'text-amber-200/80' : 'text-amber-700'}`}>{entry.content}</span>
+                  </>
+                )}
+
+                {entry.type === 'suggestions' && entry.meta?.actions && (
+                  <div className="flex-1 min-w-0">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1">
+                      {(entry.meta.actions as Array<{ id: string; emoji: string; title: string; description: string }>).map((action) => (
+                        <button
+                          key={action.id}
+                          onClick={() => sendMessage(action.title)}
+                          disabled={isProcessing}
+                          className={`text-left px-3.5 py-3 rounded-xl border transition-all disabled:opacity-50 ${isDark
+                            ? 'bg-gray-800/40 hover:bg-gray-700/60 border-gray-700/60 hover:border-blue-500/50'
+                            : 'bg-white hover:bg-blue-50 border-gray-200 hover:border-blue-300 shadow-sm'
+                          }`}
+                        >
+                          <div className="flex items-start gap-2.5">
+                            <span className="text-base flex-shrink-0 mt-0.5">{action.emoji}</span>
+                            <div className="min-w-0">
+                              <p className={`text-xs font-medium ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{action.title}</p>
+                              <p className={`text-[11px] mt-0.5 leading-relaxed ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{action.description}</p>
+                            </div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {entry.type === 'text' && (
+                  <>
+                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-gray-700/60 text-gray-300' : 'bg-gray-200 text-gray-600'}`}>AI</span>
+                    <div className="flex-1 min-w-0 overflow-x-auto">
+                      <StreamingText content={entry.content} isStreaming={isProcessing && entry.id === activities[activities.length - 1]?.id} />
+                    </div>
+                  </>
+                )}
+
+                {entry.type === 'file_download' && (
+                  <>
+                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-emerald-900/20 text-emerald-300' : 'bg-emerald-50 text-emerald-700'}`}>FILE</span>
+                    <span className={`text-xs ${isDark ? 'text-emerald-400' : 'text-emerald-600'}`}>
+                      {locale === 'zh' ? '文件已生成 ↓' : 'File ready ↓'}
+                    </span>
+                  </>
+                )}
+
+                {entry.type === 'error' && (
+                  <>
+                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-red-900/20 text-red-300' : 'bg-red-50 text-red-600'}`}>ERR</span>
+                    <pre className={`text-xs overflow-x-auto max-h-20 overflow-y-auto flex-1 p-1.5 rounded ${isDark ? 'text-red-300/80 bg-red-900/10' : 'text-red-600 bg-red-50'}`}>
+                      {entry.content.slice(0, 500)}
+                    </pre>
+                  </>
+                )}
+              </div>
+            );
+          })}
 
           {isProcessing && (
             <div className={`flex items-center gap-2 text-xs py-1 max-w-3xl mx-auto w-full ${isDark ? 'text-blue-400' : 'text-blue-600'}`}>
