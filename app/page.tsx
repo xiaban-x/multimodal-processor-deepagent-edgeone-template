@@ -346,7 +346,7 @@ export default function Home() {
               if (event.stderr?.trim()) {
                 // Show only the first meaningful error line, not full Python traceback
                 const lines = event.stderr.trim().split('\n');
-                const errorLine = lines.find(l =>
+                const errorLine = lines.find((l: string) =>
                   /^(Error|Exception|ValueError|TypeError|ImportError|SyntaxError|AttributeError|NameError|KeyError|IndexError|OSError|IOError|RuntimeError|ModuleNotFoundError|FileNotFoundError|PermissionError|ZeroDivisionError)/
                     .test(l)
                 ) || lines[lines.length - 1] || lines[0];
