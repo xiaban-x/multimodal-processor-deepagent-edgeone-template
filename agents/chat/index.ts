@@ -56,6 +56,9 @@ async function resolveClaudeSessionBinding(
   return { sessionId };
 }
 
+/** In-process file cache: persists uploaded files across follow-up requests within same process */
+const _sessionFileCache = new Map<string, Array<{ name: string; base64: string }>>();
+
 export async function onRequest(context: any) {
   const ctxEnv: Record<string, string | undefined> = context.env ?? process.env;
 
@@ -78,6 +81,24 @@ export async function onRequest(context: any) {
   const signal: AbortSignal | undefined = context.request.signal;
   const conversationId: string = body.conversationId || context.conversation_id || '';
   const sandbox = context.sandbox ?? null;
+
+  // ─── Session file cache: persist uploaded files across follow-up requests ────
+  // The EdgeOne sandbox /tmp/ is ephemeral — re-upload cached files on every request.
+  const cachedSessionFiles: Array<{ name: string; base64: string }> =
+    conversationId ? (_sessionFileCache.get(conversationId) ?? []) : [];
+
+  if (conversationId && uploadedFiles.length > 0) {
+    // Merge new files with cached ones (new files override existing with same name)
+    const mergedMap = new Map(cachedSessionFiles.map(f => [f.name, f]));
+    uploadedFiles.forEach(f => mergedMap.set(f.name, f));
+    _sessionFileCache.set(conversationId, Array.from(mergedMap.values()));
+  }
+
+  // On follow-up requests (no new files), re-upload all cached files to the (possibly fresh) sandbox
+  const filesToUpload: Array<{ name: string; base64: string }> =
+    uploadedFiles.length > 0
+      ? (_sessionFileCache.get(conversationId) ?? uploadedFiles)
+      : cachedSessionFiles;
   const store = context.store ?? null;
   const cwd = process.cwd();
 
@@ -110,8 +131,8 @@ export async function onRequest(context: any) {
   }
 
   // ─── Write uploaded files to sandbox ────────────────────────────────────────
-  if (sandboxWorking && uploadedFiles.length > 0) {
-    for (const file of uploadedFiles) {
+  if (sandboxWorking && filesToUpload.length > 0) {
+    for (const file of filesToUpload) {
       try {
         const sandboxPath = `/tmp/${file.name}`;
         let uploadSuccess = false;
@@ -181,8 +202,8 @@ export async function onRequest(context: any) {
     }
 
     // Tell the AI files are ready — no need to list /tmp
-    if (sandboxWorking && uploadedFiles.length > 0) {
-      const fileList = uploadedFiles.map(f => `/tmp/${f.name}`).join(', ');
+    if (sandboxWorking && filesToUpload.length > 0) {
+      const fileList = filesToUpload.map(f => `/tmp/${f.name}`).join(', ');
       const sysMsg = locale === 'zh'
         ? `\n\n[系统提示：文件已就绪，路径为: ${fileList}。请直接分析和处理，不需要先 list 目录确认。]`
         : `\n\n[System: Files are ready at: ${fileList}. Start analysis directly — do not list the directory first.]`;
