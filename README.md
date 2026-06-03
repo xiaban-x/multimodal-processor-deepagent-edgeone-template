@@ -1,171 +1,114 @@
 # Multimodal Processor
 
-AI-powered document processing agent built on EdgeOne Makers. Upload files (PDF, Word, Excel, images, video, CSV, text) and get intelligent analysis with interactive processing options.
+**Language:** English | [简体中文](./README_zh-CN.md)
 
-## Features
+AI-powered document processing agent that analyzes files (images, PDFs, CSVs, video, text) and performs interactive operations via sandbox execution. Built on the Claude Agent SDK and deployed on EdgeOne Makers.
 
-- **Smart File Analysis** — Auto-detects file type and provides tailored processing options
-- **Skills-Based Architecture** — Dynamically loads only relevant processing skills per file type (saves ~40% tokens)
-- **Interactive Suggestions** — Clickable action cards after every analysis (powered by `suggest_actions` tool)
-- **Sandbox Execution** — Real file processing via EdgeOne sandbox (Python, shell commands, code interpreter)
-- **File Delivery** — Generated files (PDF reports, converted images) delivered as downloadable links
-- **Bilingual UI** — Full Chinese/English interface with locale-aware AI output
-- **Real-time Streaming** — SSE streaming with tool execution progress and live code output
+**Framework:** None (raw Node.js) · **Category:** File Processing · **Language:** TypeScript
 
-## Architecture
+[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/makers/new?template=multimodal-processor-edgeone&from=within&fromAgent=1&agentLang=typescript)
 
-```
-Frontend (Next.js 16 + React 19)
-  └─ POST /chat (SSE stream)
-       └─ Claude Agent SDK query() loop
-            ├─ EdgeOne sandbox MCP server  (via context.tools.toClaudeMcpServer())
-            │    ├─ code_interpreter (Python: Pillow, pandas, matplotlib, etc.)
-            │    ├─ commands (shell: ffprobe, ffmpeg, base64, etc.)
-            │    └─ files_read / files_write / files_list / …
-            └─ Custom tools MCP server     (via createSdkMcpServer())
-                 ├─ suggest_actions → UI action cards
-                 └─ deliver_file → downloadable file output
-  └─ POST /stop
-       └─ AbortController → graceful cancellation
-```
+<!-- TODO: confirm -->
+![preview](./assets/preview.png)
 
-### SSE Event Types
+## Overview
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `text_delta` | `{ delta }` | Incremental assistant text |
-| `tool_called` | `{ tool, input }` | Tool invocation started |
-| `code_output` | `{ stdout }` | Python/code stdout |
-| `code_error` | `{ stderr }` | Python/code stderr or exception |
-| `suggest_actions` | `{ actions[] }` | Clickable action cards |
-| `file_output` | `{ filename, base64, description }` | Downloadable file |
+This template turns uploaded files into actionable insights and transformed outputs. It auto-detects file types, loads specialized processing skills, runs Python and shell commands inside a secure sandbox, and delivers generated files back to the user. A dual MCP server architecture exposes both sandbox tools (code interpreter, commands, file I/O) and custom UI tools (action suggestions, file delivery) to the AI agent.
 
-### Skills System
+- **Skills-Based Analysis** — Dynamically loads file-type-specific skills (image, CSV, PDF, Word, Excel, video, text) to tailor the system prompt and available operations.
+- **Sandbox Execution** — Runs Python (Pillow, pandas, matplotlib) and shell commands (ffprobe, ffmpeg) in an EdgeOne sandbox with automatic credential injection.
+- **Interactive Actions** — After analysis, the agent presents clickable action cards via the `suggest_actions` custom tool; processed files are delivered via `deliver_file`.
+- **Session File Cache** — Uploaded files persist across follow-up requests within the same conversation via an in-process cache that re-uploads to the sandbox on every turn.
+- **Bilingual UI** — Full Chinese / English interface with locale-aware AI output.
 
-The system prompt is built dynamically based on uploaded file types:
-
-| File Type | Loaded Skill | Capabilities |
-|-----------|-------------|--------------|
-| Images (.jpg/.png/.webp) | `SKILL_IMAGE` | Format conversion, compression, resize, watermark |
-| CSV | `SKILL_CSV` | Statistics, visualization, export, profiling |
-| PDF | `SKILL_PDF` | Text extraction, table extraction, merge |
-| Word (.docx) | `SKILL_WORD` | Text extraction, convert to PDF |
-| Excel (.xlsx) | `SKILL_EXCEL` | Sheet reading, stats, charts, CSV export |
-| Video (.mp4/.mov) | `SKILL_VIDEO` | Metadata extraction, thumbnails |
-| Text/MD/JSON | `SKILL_TEXT` | Summarize, reformat, translate, structure analysis |
-| Mixed (multiple types) | `SKILL_MIXED` | Cross-file analysis, merge, compare |
-
-PDF Generation skill (`SKILL_PDF_GENERATION`) is auto-loaded when PDF output may be needed. It injects ready-to-run Python templates using matplotlib + PdfPages with full CJK font support.
-
-### Agent Endpoints
-
-| Endpoint | Purpose |
-|----------|---------|
-| `/chat` | Main processing agent (SSE streaming, tool-use loop) |
-| `/stop` | Cancel active processing |
-| `/test` | Model connectivity test |
-| `/gateway_test` | AI Gateway latency/timeout diagnostics |
-| `/health` | Health check |
-| `/sandbox_test` | Sandbox connectivity diagnostics |
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- EdgeOne CLI (`npm i -g @edgeone/cli`)
-
-### Setup
-
-```bash
-# Install dependencies
-npm install
-
-# Create .env file
-cat > .env << EOF
-AI_GATEWAY_API_KEY=your_api_key
-AI_GATEWAY_BASE_URL=your_base_url
-EOF
-
-# Start development server
-edgeone makers dev
-```
-
-### Development
-
-```bash
-# Type check
-npx tsc --noEmit
-
-# Build
-edgeone makers build
-
-# Test sandbox connectivity
-curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/json' -d '{}'
-
-# Test model connectivity
-curl -X POST http://localhost:8088/test -H 'Content-Type: application/json' -d '{"message":"hello"}'
-```
-
-## Deployment
-
-Deploy to EdgeOne Makers:
-
-```bash
-edgeone makers deploy
-```
-
-Sandbox credentials and project ID are automatically injected by the deployment pipeline. No manual configuration needed.
-
-### Environment Variables
+## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AI_GATEWAY_API_KEY` | Yes | AI Gateway API key |
-| `AI_GATEWAY_BASE_URL` | Yes | AI Gateway base URL |
+| `AI_GATEWAY_API_KEY` | Yes | Model gateway API key. Use your Makers Models API Key, or any OpenAI-compatible provider key. |
+| `AI_GATEWAY_BASE_URL` | Yes | Gateway base URL. For Makers Models, use `https://ai-gateway.edgeone.link/v1`. |
 
-### Obtaining Environment Variables
 
-Both variables are provided by the **EdgeOne Makers** platform:
+This template follows the OpenAI-compatible standard — point these at Makers Models or any compatible provider.
 
-1. Open the [EdgeOne console](https://console.cloud.tencent.com/edgeone) and navigate to **EdgeOne Makers**.
-2. Create or open your project, then go to **Settings → Environment Variables**.
-3. Copy the auto-generated values for `AI_GATEWAY_API_KEY` and `AI_GATEWAY_BASE_URL` into your local `.env` file.
+### How to get AI_GATEWAY_API_KEY
 
-> These values are project-scoped credentials issued by the EdgeOne AI Gateway. They are automatically injected into the runtime environment on deployment — you only need them locally for `edgeone makers dev`.
+1. Open the Makers Console (https://console.cloud.tencent.com/edgeone/makers)
+2. Sign in and enable Makers
+3. Go to Makers → Models → API Key and create a key
+4. Copy it into `AI_GATEWAY_API_KEY`
 
-## Tech Stack
+> Built-in models are free within quota and great for validation. For production, bind your own paid provider key (BYOK).
 
-- **Runtime**: EdgeOne Makers Agent (Cloud Functions + Sandbox)
-- **Frontend**: Next.js 16 + React 19 + Tailwind CSS
-- **AI**: Anthropic Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) with dual MCP server pattern
-- **Sandbox**: EdgeOne sandbox via `context.tools.toClaudeMcpServer()` (code_interpreter, commands, files)
-- **Streaming**: Server-Sent Events (SSE)
-- **i18n**: Custom React Context (zh/en)
+## Local Development
+
+**Prerequisites**
+- Node.js 18+
+- EdgeOne CLI (`npm i -g @edgeone/cli`)
+
+```bash
+npm install
+cp .env.example .env
+# Edit .env with your AI_GATEWAY_API_KEY and AI_GATEWAY_BASE_URL
+edgeone makers dev
+```
+
+Open the local observability dashboard at http://localhost:8080/agent-metrics.
 
 ## Project Structure
 
 ```
+multimodal-processor-edgeone/
 ├── agents/
 │   ├── chat/
-│   │   ├── index.ts      # Main agent: session mgmt, file upload, SSE loop
-│   │   ├── skills.ts     # Skills system: dynamic system prompt builder
-│   │   ├── templates.ts  # PDF/chart Python code templates (CJK font support)
-│   │   └── tools.ts      # Helpers: shellQuote, canInlineFallbackFile, buildDefaultActions
-│   ├── _shared.ts        # SSE helpers (sseEvent, createSSEResponse), logger
+│   │   ├── index.ts      # POST /chat — main agent: session mgmt, file upload, SSE loop
+│   │   ├── skills.ts     # Dynamic system prompt builder per file type
+│   │   ├── templates.ts  # PDF/chart Python templates (CJK font support)
+│   │   └── tools.ts      # Shell quoting, fallback file inlining, default actions
+│   ├── stop/             # POST /stop — abort active run
 │   ├── _model.ts         # Model name resolution, gateway env mapping
-│   ├── stop.ts           # Cancel active run
-│   ├── test.ts           # Model connectivity test
-│   ├── gateway_test.ts   # AI Gateway latency diagnostics
-│   ├── health.ts         # Health check
-│   └── sandbox_test.ts   # Sandbox diagnostics
-├── app/
-│   ├── page.tsx          # Main page: file upload, activity feed, action cards
-│   └── layout.tsx        # Root layout with i18n provider
+│   └── _shared.ts        # SSE helpers, logger
+├── cloud-functions/
+│   └── health/           # GET /health
+├── app/                  # Next.js App Router frontend
 ├── lib/
-│   └── i18n.tsx          # Translations (zh/en)
-└── edgeone.json          # EdgeOne platform config
+│   └── i18n.tsx          # Chinese / English translations
+└── edgeone.json          # EdgeOne deployment config
 ```
+
+Files prefixed with `_` are private modules — not exposed as public routes.
+
+## How It Works
+
+### Runtime Mode
+Files under `agents/` run in **session mode**: requests with the same `conversation_id` are sticky-routed to the same agent instance and the same sandbox. This ensures uploaded files and sandbox state remain available across follow-up messages.
+
+### End-to-End Workflow
+
+1. **File upload** — The frontend encodes files as base64 and POSTs `{ message, files, conversationId }` to `/chat`.
+2. **Session cache** — Files are merged into a per-conversation in-process cache so they survive across follow-up turns.
+3. **Sandbox write** — The handler writes cached files to `/tmp/` in the EdgeOne sandbox using base64 decode (shell or Python fallback).
+4. **Skill selection** — The system prompt is built dynamically based on uploaded file types (image, CSV, PDF, Word, Excel, video, text, or mixed).
+5. **Agent loop** — The Claude Agent SDK `query()` loop drives the LLM with two MCP servers:
+   - **EdgeOne sandbox MCP** (`context.tools.toClaudeMcpServer()`) exposes `code_interpreter`, `commands`, and file I/O tools.
+   - **Custom tools MCP** exposes `suggest_actions` (UI action cards) and `deliver_file` (downloadable output).
+6. **Tool execution** — The AI may run Python for data analysis, shell commands for media processing, or read/write sandbox files.
+7. **SSE streaming** — Events include `text_delta` (assistant text), `tool_called` (tool start), `code_output` / `code_error` (execution results), `suggest_actions` (clickable options), and `file_output` (base64 download).
+8. **Fallback** — If the sandbox is unavailable, text files are inlined directly into the prompt; binary files are skipped with a notice.
+
+### Key Routes & Parameters
+- `/chat` — Main processing endpoint. Body: `{ message, files[], conversationId }`.
+- `/stop` — Cancels the active query run for a conversation.
+- `conversation_id` can be passed in the request body or is provided automatically via `context.conversation_id`.
+
+### Timeouts
+No custom agent timeout is configured; the platform default applies.
+
+## Resources
+
+- [Makers Agents Documentation](https://edgeone.ai/makers)
+- [Makers Quick Start](https://edgeone.ai/makers/docs/quickstart)
+- [Makers Models](https://console.cloud.tencent.com/edgeone/makers/models)
 
 ## License
 

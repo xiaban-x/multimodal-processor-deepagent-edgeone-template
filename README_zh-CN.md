@@ -1,171 +1,113 @@
-# 多模态文件处理助手
+# Multimodal Processor（多模态文件处理器）
 
-基于 EdgeOne Makers 的 AI 文档处理 Agent。支持上传 PDF、Word、Excel、图片、视频、CSV、文本文件，自动分析并提供智能处理选项。
+**语言：** [English](./README.md) | 简体中文
 
-## 功能特性
+基于 Claude Agent SDK 构建、部署在 EdgeOne Makers 上的 AI 文档处理 Agent，支持图片、PDF、CSV、视频、文本等多种文件的分析与交互式操作。
 
-- **智能文件分析** — 自动检测文件类型，提供针对性处理建议
-- **Skills 动态加载** — 根据文件类型按需加载处理技能，节省 ~40% token 消耗
-- **交互式推荐** — 每次分析后展示可点击的操作卡片（基于 `suggest_actions` 工具）
-- **沙箱执行** — 通过 EdgeOne 沙箱执行真实文件处理（Python、Shell 命令、代码解释器）
-- **文件交付** — 生成的文件（PDF 报告、转换后的图片）以可下载链接形式交付
-- **中英双语** — 完整的中英文界面，AI 输出自动适配语言
-- **实时流式** — SSE 流式传输 + 工具执行进度 + 代码输出实时展示
+**Framework:** None (raw Node.js) · **Category:** File Processing · **Language:** TypeScript
 
-## 架构
+[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/makers/new?template=multimodal-processor-edgeone&from=within&fromAgent=1&agentLang=typescript)
 
-```
-前端 (Next.js 16 + React 19)
-  └─ POST /chat (SSE 流)
-       └─ Claude Agent SDK query() 循环
-            ├─ EdgeOne 沙箱 MCP server  (via context.tools.toClaudeMcpServer())
-            │    ├─ code_interpreter (Python: Pillow, pandas, matplotlib 等)
-            │    ├─ commands (Shell: ffprobe, ffmpeg, base64 等)
-            │    └─ files_read / files_write / files_list / …
-            └─ 自定义工具 MCP server   (via createSdkMcpServer())
-                 ├─ suggest_actions → 前端操作卡片
-                 └─ deliver_file → 可下载文件输出
-  └─ POST /stop
-       └─ AbortController → 优雅取消
-```
+<!-- TODO: confirm -->
+![preview](./assets/preview.png)
 
-### SSE 事件类型
+## Overview
 
-| 事件 | 数据 | 说明 |
-|------|------|------|
-| `text_delta` | `{ delta }` | AI 回复文本增量 |
-| `tool_called` | `{ tool, input }` | 工具调用开始 |
-| `code_output` | `{ stdout }` | Python/代码标准输出 |
-| `code_error` | `{ stderr }` | Python/代码错误输出或异常 |
-| `suggest_actions` | `{ actions[] }` | 可点击操作卡片 |
-| `file_output` | `{ filename, base64, description }` | 可下载文件 |
+本模板将上传的文件转化为可操作的洞察与转换输出。它自动识别文件类型并加载对应的处理技能，在安全沙箱中运行 Python 与 Shell 命令，并将生成文件交付给用户。双 MCP 服务器架构同时向 AI Agent 暴露沙箱工具（代码解释器、命令、文件 I/O）与自定义 UI 工具（操作建议、文件交付）。
 
-### Skills 技能系统
+- **基于技能的分析** — 根据文件类型动态加载专用技能（图片、CSV、PDF、Word、Excel、视频、文本），定制系统提示与可用操作。
+- **沙箱执行** — 在 EdgeOne 沙箱中运行 Python（Pillow、pandas、matplotlib）与 Shell 命令（ffprobe、ffmpeg），凭证由平台自动注入。
+- **交互式操作** — 分析完成后，Agent 通过 `suggest_actions` 自定义工具展示可点击的操作卡片；处理后的文件通过 `deliver_file` 交付。
+- **会话文件缓存** — 同一对话内的上传文件通过进程内缓存跨请求保留，每轮自动重新写入沙箱。
+- **双语界面** — 完整中 / 英界面，AI 输出根据语言环境自动适配。
 
-系统提示词根据上传文件类型动态构建：
+## Environment Variables
 
-| 文件类型 | 加载的技能 | 能力 |
-|---------|-----------|------|
-| 图片 (.jpg/.png/.webp) | `SKILL_IMAGE` | 格式转换、压缩、调整尺寸、水印 |
-| CSV | `SKILL_CSV` | 统计分析、数据可视化、导出、数据画像 |
-| PDF | `SKILL_PDF` | 文字提取、表格提取、合并 |
-| Word (.docx) | `SKILL_WORD` | 文字提取、转换为 PDF |
-| Excel (.xlsx) | `SKILL_EXCEL` | 多 Sheet 读取、统计、图表、导出 CSV |
-| 视频 (.mp4/.mov) | `SKILL_VIDEO` | 元数据提取、缩略图 |
-| 文本/MD/JSON | `SKILL_TEXT` | 摘要、格式转换、翻译、结构分析 |
-| 混合（多种类型） | `SKILL_MIXED` | 跨文件分析、合并、对比 |
+| 变量 | 必填 | 说明 |
+|----------|----------|-------------|
+| `AI_GATEWAY_API_KEY` | 是 | 模型网关 API Key。使用 Makers Models 的 API Key，或任何兼容 OpenAI 协议的提供商 Key。 |
+| `AI_GATEWAY_BASE_URL` | 是 | 网关基础地址。使用 Makers Models 时填写 `https://ai-gateway.edgeone.link/v1`。 |
 
-当可能需要生成 PDF 时，自动加载 PDF 生成技能（`SKILL_PDF_GENERATION`）。该技能注入了使用 matplotlib + PdfPages 的完整 Python 代码模板，内置中文字体探测支持。
+本模板遵循 OpenAI 兼容标准 —— 可指向 Makers Models 或任何兼容提供商。
 
-### Agent 端点
+### 如何获取 AI_GATEWAY_API_KEY
 
-| 端点 | 功能 |
-|------|------|
-| `/chat` | 主处理 Agent（SSE 流式、工具循环） |
-| `/stop` | 取消当前处理 |
-| `/test` | 模型连通性测试 |
-| `/gateway_test` | AI 网关延迟/超时诊断 |
-| `/health` | 服务健康检查 |
-| `/sandbox_test` | 沙箱连通性诊断 |
+1. 打开 Makers 控制台（https://console.cloud.tencent.com/edgeone/makers）
+2. 登录并启用 Makers
+3. 进入 Makers → Models → API Key，创建 Key
+4. 将其填入 `AI_GATEWAY_API_KEY`
 
-## 快速开始
+> 内置模型在额度内免费，适合验证；生产环境请绑定自费厂商 Key（BYOK）。
 
-### 前置要求
+## 本地开发
 
+**前置依赖**
 - Node.js 18+
-- EdgeOne CLI (`npm i -g @edgeone/cli`)
-
-### 安装
+- EdgeOne CLI（`npm i -g @edgeone/cli`）
 
 ```bash
-# 安装依赖
 npm install
-
-# 创建 .env 文件
-cat > .env << EOF
-AI_GATEWAY_API_KEY=your_api_key
-AI_GATEWAY_BASE_URL=your_base_url
-EOF
-
-# 启动开发服务器
+cp .env.example .env
+# 编辑 .env，填入 AI_GATEWAY_API_KEY 与 AI_GATEWAY_BASE_URL
 edgeone makers dev
 ```
 
-### 开发
-
-```bash
-# 类型检查
-npx tsc --noEmit
-
-# 构建
-edgeone makers build
-
-# 测试沙箱连通性
-curl -X POST http://localhost:8088/sandbox_test -H 'Content-Type: application/json' -d '{}'
-
-# 测试模型连通性
-curl -X POST http://localhost:8088/test -H 'Content-Type: application/json' -d '{"message":"hello"}'
-```
-
-## 部署
-
-部署到 EdgeOne Makers：
-
-```bash
-edgeone makers deploy
-```
-
-沙箱凭证和项目 ID 由部署流水线自动注入，无需手动配置。
-
-### 环境变量
-
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `AI_GATEWAY_API_KEY` | 是 | AI 网关 API Key |
-| `AI_GATEWAY_BASE_URL` | 是 | AI 网关地址 |
-
-### 获取环境变量
-
-以上两个变量由 **EdgeOne Makers** 平台提供：
-
-1. 打开 [EdgeOne 控制台](https://console.cloud.tencent.com/edgeone)，进入 **EdgeOne Makers**。
-2. 创建或打开项目，进入 **设置 → 环境变量**。
-3. 将自动生成的 `AI_GATEWAY_API_KEY` 和 `AI_GATEWAY_BASE_URL` 复制到本地 `.env` 文件。
-
-> 这两个值是 EdgeOne AI Gateway 颁发的项目级凭证，部署后会自动注入运行时环境，本地 `edgeone makers dev` 时才需要手动填写。
-
-## 技术栈
-
-- **运行时**：EdgeOne Makers Agent（云函数 + 沙箱）
-- **前端**：Next.js 16 + React 19 + Tailwind CSS
-- **AI**：Anthropic Claude Agent SDK（`@anthropic-ai/claude-agent-sdk`），双 MCP server 模式
-- **沙箱**：EdgeOne Sandbox，通过 `context.tools.toClaudeMcpServer()` 接入（code_interpreter、commands、files）
-- **流式传输**：Server-Sent Events (SSE)
-- **国际化**：自定义 React Context (zh/en)
+本地可观测面板地址：http://localhost:8080/agent-metrics。
 
 ## 项目结构
 
 ```
+multimodal-processor-edgeone/
 ├── agents/
 │   ├── chat/
-│   │   ├── index.ts      # 主 Agent：会话管理、文件上传、SSE 流循环
-│   │   ├── skills.ts     # 技能系统：基于文件类型动态构建系统提示词
-│   │   ├── templates.ts  # PDF/图表 Python 代码模板（含中文字体支持）
-│   │   └── tools.ts      # 工具函数：shellQuote、canInlineFallbackFile、buildDefaultActions
-│   ├── _shared.ts        # SSE 工具函数（sseEvent、createSSEResponse）、日志
-│   ├── _model.ts         # 模型名称解析、AI 网关环境变量映射
-│   ├── stop.ts           # 取消活跃请求
-│   ├── test.ts           # 模型连通性测试
-│   ├── gateway_test.ts   # AI 网关延迟诊断
-│   ├── health.ts         # 健康检查
-│   └── sandbox_test.ts   # 沙箱诊断
-├── app/
-│   ├── page.tsx          # 主页：文件上传、活动流、操作卡片
-│   └── layout.tsx        # 根布局 + i18n Provider
+│   │   ├── index.ts      # POST /chat —— 主 Agent：会话管理、文件上传、SSE 循环
+│   │   ├── skills.ts     # 按文件类型构建动态系统提示
+│   │   ├── templates.ts  # PDF / 图表 Python 模板（支持 CJK 字体）
+│   │   └── tools.ts      # Shell 引号、文件内联降级、默认操作
+│   ├── stop/             # POST /stop —— 中止运行
+│   ├── _model.ts         # 模型名称解析、网关环境变量映射
+│   └── _shared.ts        # SSE 辅助函数、日志
+├── cloud-functions/
+│   └── health/           # GET /health
+├── app/                  # Next.js App Router 前端
 ├── lib/
-│   └── i18n.tsx          # 翻译文件 (zh/en)
-└── edgeone.json          # EdgeOne 平台配置
+│   └── i18n.tsx          # 中 / 英翻译
+└── edgeone.json          # EdgeOne 部署配置
 ```
+
+以 `_` 为前缀的文件是私有模块，不会作为公共路由暴露。
+
+## 工作原理
+
+### 运行模式
+`agents/` 下的文件以**会话模式**运行：相同 `conversation_id` 的请求会被粘性路由到同一 Agent 实例及同一沙箱。这保证了上传文件与沙箱状态在后续消息中始终可用。
+
+### 端到端流程
+
+1. **文件上传** —— 前端将文件编码为 base64，向 `/chat` POST `{ message, files, conversationId }`。
+2. **会话缓存** —— 文件被合并到按会话划分的进程内缓存，确保在后续追问中不丢失。
+3. **写入沙箱** —— 处理器将缓存文件通过 base64 解码（Shell 或 Python 降级策略）写入 EdgeOne 沙箱的 `/tmp/` 目录。
+4. **技能选择** —— 根据上传文件类型（图片、CSV、PDF、Word、Excel、视频、文本或混合）动态构建系统提示。
+5. **Agent 循环** —— Claude Agent SDK 的 `query()` 循环驱动 LLM，同时挂载两个 MCP 服务器：
+   - **EdgeOne 沙箱 MCP**（`context.tools.toClaudeMcpServer()`）暴露 `code_interpreter`、`commands` 与文件 I/O 工具。
+   - **自定义工具 MCP** 暴露 `suggest_actions`（UI 操作卡片）与 `deliver_file`（可下载输出）。
+6. **工具执行** —— AI 可运行 Python 进行数据分析、Shell 命令进行媒体处理，或读写沙箱文件。
+7. **SSE 流式输出** —— 事件包括 `text_delta`（助手文本）、`tool_called`（工具启动）、`code_output` / `code_error`（执行结果）、`suggest_actions`（可点击选项）与 `file_output`（base64 下载）。
+8. **降级处理** —— 若沙箱不可用，文本文件直接内联到提示中；二进制文件被跳过并提示用户。
+
+### 关键路由与参数
+- `/chat` —— 主处理端点。请求体：`{ message, files[], conversationId }`。
+- `/stop` —— 取消某对话的活跃查询运行。
+- `conversation_id` 可通过请求体传入，或由运行时通过 `context.conversation_id` 自动提供。
+
+### 运行参数
+未自定义 Agent 超时，使用平台默认值。
+
+## 相关资源
+
+- [Makers Agents 文档](https://edgeone.ai/makers)
+- [Makers 快速开始](https://edgeone.ai/makers/docs/quickstart)
+- [Makers Models](https://console.cloud.tencent.com/edgeone/makers/models)
 
 ## 许可证
 
