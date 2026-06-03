@@ -6,7 +6,7 @@ AI-powered document processing agent that analyzes files (images, PDFs, CSVs, vi
 
 **Framework:** None (raw Node.js) · **Category:** File Processing · **Language:** TypeScript
 
-[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/makers/new?template=multimodal-processor-edgeone&from=within&fromAgent=1&agentLang=typescript)
+[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.tencentcloud.com/edgeone/makers/new?template=multimodal-processor-edgeone&from=within&fromAgent=1&agentLang=typescript)
 
 <!-- TODO: confirm -->
 ![preview](./assets/preview.png)
