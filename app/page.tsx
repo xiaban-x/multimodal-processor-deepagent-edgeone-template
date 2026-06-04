@@ -391,8 +391,11 @@ export default function Home() {
     try {
       const resp = await fetch('/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: fullMessage, conversationId, files: filesToUpload.length > 0 ? filesToUpload : undefined }),
+        headers: {
+          'Content-Type': 'application/json',
+          'makers-conversation-id': conversationId,
+        },
+        body: JSON.stringify({ message: fullMessage, files: filesToUpload.length > 0 ? filesToUpload : undefined }),
       });
 
       if (!resp.ok) {

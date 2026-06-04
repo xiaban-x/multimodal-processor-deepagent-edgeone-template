@@ -84,7 +84,7 @@ multimodal-processor-edgeone/
 
 ### 端到端流程
 
-1. **文件上传** —— 前端将文件编码为 base64，向 `/chat` POST `{ message, files, conversationId }`。
+1. **文件上传** —— 前端将文件编码为 base64，POST `/chat`：HTTP Header 带 `makers-conversation-id`，请求体 `{ message, files }`。
 2. **会话缓存** —— 文件被合并到按会话划分的进程内缓存，确保在后续追问中不丢失。
 3. **写入沙箱** —— 处理器将缓存文件通过 base64 解码（Shell 或 Python 降级策略）写入 EdgeOne 沙箱的 `/tmp/` 目录。
 4. **技能选择** —— 根据上传文件类型（图片、CSV、PDF、Word、Excel、视频、文本或混合）动态构建系统提示。
@@ -96,9 +96,10 @@ multimodal-processor-edgeone/
 8. **降级处理** —— 若沙箱不可用，文本文件直接内联到提示中；二进制文件被跳过并提示用户。
 
 ### 关键路由与参数
-- `/chat` —— 主处理端点。请求体：`{ message, files[], conversationId }`。
-- `/stop` —— 取消某对话的活跃查询运行。
-- `conversation_id` 可通过请求体传入，或由运行时通过 `context.conversation_id` 自动提供。
+- `/chat` —— 主处理端点。Header：`makers-conversation-id: <uuid>`；Body：`{ message, files[] }`。
+- `/stop` —— 取消某对话的活跃查询运行。Body：`{ conversation_id: <uuid> }`（**不要带 `makers-conversation-id` Header**，否则会粘性路由到正在执行的 chat 实例，abort 失效）。
+- `/health` —— 简单的存活探针（位于 `cloud-functions/`，不涉及 AI）。
+- `conversation_id` 由前端生成（如 `crypto.randomUUID()`），通过 `makers-conversation-id` Header 传入；运行时会自动绑定到 `context.conversation_id`。
 
 ### 运行参数
 未自定义 Agent 超时，使用平台默认值。

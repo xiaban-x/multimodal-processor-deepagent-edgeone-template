@@ -79,7 +79,16 @@ export async function onRequest(context: any) {
   }
 
   const signal: AbortSignal | undefined = context.request.signal;
-  const conversationId: string = body.conversationId || context.conversation_id || '';
+  // EdgeOne Makers auto-injects context.conversation_id from the `makers-conversation-id` header.
+  // Read the header directly as a defensive fallback for older runtimes.
+  const headerConvId = (() => {
+    try {
+      return context?.request?.headers?.get?.('makers-conversation-id') ?? '';
+    } catch {
+      return '';
+    }
+  })();
+  const conversationId: string = context.conversation_id || headerConvId || '';
   const sandbox = context.sandbox ?? null;
 
   // ─── Session file cache: persist uploaded files across follow-up requests ────

@@ -85,7 +85,7 @@ Files under `agents/` run in **session mode**: requests with the same `conversat
 
 ### End-to-End Workflow
 
-1. **File upload** — The frontend encodes files as base64 and POSTs `{ message, files, conversationId }` to `/chat`.
+1. **File upload** — The frontend encodes files as base64 and POSTs `/chat` with the `makers-conversation-id` HTTP header and body `{ message, files }`.
 2. **Session cache** — Files are merged into a per-conversation in-process cache so they survive across follow-up turns.
 3. **Sandbox write** — The handler writes cached files to `/tmp/` in the EdgeOne sandbox using base64 decode (shell or Python fallback).
 4. **Skill selection** — The system prompt is built dynamically based on uploaded file types (image, CSV, PDF, Word, Excel, video, text, or mixed).
@@ -97,9 +97,10 @@ Files under `agents/` run in **session mode**: requests with the same `conversat
 8. **Fallback** — If the sandbox is unavailable, text files are inlined directly into the prompt; binary files are skipped with a notice.
 
 ### Key Routes & Parameters
-- `/chat` — Main processing endpoint. Body: `{ message, files[], conversationId }`.
-- `/stop` — Cancels the active query run for a conversation.
-- `conversation_id` can be passed in the request body or is provided automatically via `context.conversation_id`.
+- `/chat` — Main processing endpoint. Header: `makers-conversation-id: <uuid>`; Body: `{ message, files[] }`.
+- `/stop` — Cancels the active query run for a conversation. Body: `{ conversation_id: <uuid> }` (**do NOT send the `makers-conversation-id` header** — it would sticky-route /stop to the busy chat instance and break abort).
+- `/health` — Simple liveness probe (lives in `cloud-functions/`, not AI-related).
+- `conversation_id` is generated client-side (e.g. `crypto.randomUUID()`) and forwarded via the `makers-conversation-id` header; the runtime auto-binds it to `context.conversation_id`.
 
 ### Timeouts
 No custom agent timeout is configured; the platform default applies.
