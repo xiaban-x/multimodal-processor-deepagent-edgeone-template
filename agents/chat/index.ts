@@ -13,8 +13,8 @@ import { query, createSdkMcpServer, getSessionInfo } from '@anthropic-ai/claude-
 import { z } from 'zod';
 import { resolveModelName, collectGatewayEnv } from '../_model';
 import { createLogger, sseEvent, createSSEResponse } from '../_shared';
-import { buildSystemPrompt } from './skills';
-import { shellQuote, canInlineFallbackFile, buildDefaultActions } from './tools';
+import { buildSystemPrompt } from './_skills';
+import { shellQuote, canInlineFallbackFile, buildDefaultActions } from './_tools';
 
 const logger = createLogger('chat');
 

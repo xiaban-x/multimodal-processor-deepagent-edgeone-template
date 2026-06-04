@@ -4,7 +4,7 @@
  */
 
 import { createLogger } from "../_shared";
-import { SKILL_PDF_GENERATION } from "./templates";
+import { SKILL_PDF_GENERATION } from "./_templates";
 
 const logger = createLogger("skills");
 
